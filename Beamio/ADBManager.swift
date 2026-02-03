@@ -340,6 +340,9 @@ private final class ADBClient {
 
         func readBytes(_ length: Int) async throws -> Data {
             try await fillBuffer(minBytes: length)
+            guard length <= buffer.count else {
+                throw ADBError.protocolError("Buffer underflow (needed \(length), have \(buffer.count))")
+            }
             let slice = buffer.prefix(length)
             buffer.removeFirst(length)
             return Data(slice)
@@ -542,7 +545,7 @@ private final class ADBConnection {
     }
 
     func start(timeout: TimeInterval = 8) async throws {
-        try await withCheckedThrowingContinuation { continuation in
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
             var didResume = false
             var lastError: Error?
             let timer = DispatchSource.makeTimerSource(queue: queue)
