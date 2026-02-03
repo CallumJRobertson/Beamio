@@ -253,7 +253,6 @@ private final class ADBClient {
             case .cnxn:
                 return
             case .auth:
-                guard let keyPair else { throw ADBError.authenticationFailed }
                 if !sentSignature, packet.arg0 == 1 {
                     let signature = try ADBKeyManager.sign(token: packet.data, with: keyPair.privateKey)
                     try await sendPacket(.auth, arg0: 2, arg1: 0, data: signature)
@@ -440,14 +439,18 @@ private final class ADBClient {
         let header = try await connection.receiveExact(24)
         if header.count < 24 { throw ADBError.connectionClosed }
 
-        let command = header.readUInt32LE(at: 0)
+        let commandRaw = header.readUInt32LE(at: 0)
         let arg0 = header.readUInt32LE(at: 4)
         let arg1 = header.readUInt32LE(at: 8)
         let length = header.readUInt32LE(at: 12)
         let checksum = header.readUInt32LE(at: 16)
         let magic = header.readUInt32LE(at: 20)
 
-        if command ^ 0xFFFFFFFF != magic {
+        guard let command = ADBCommand(rawValue: commandRaw) else {
+            throw ADBError.protocolError("Unknown command: \(commandRaw)")
+        }
+
+        if command.rawValue ^ 0xFFFFFFFF != magic {
             throw ADBError.protocolError("Invalid magic")
         }
 
@@ -490,7 +493,7 @@ private enum ADBCommand: UInt32 {
 }
 
 private struct ADBPacket {
-    let command: UInt32
+    let command: ADBCommand
     let arg0: UInt32
     let arg1: UInt32
     let length: UInt32
@@ -530,7 +533,7 @@ private final class ADBConnection {
     }
 
     func send(_ data: Data) async throws {
-        try await withCheckedThrowingContinuation { continuation in
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
             connection.send(content: data, completion: .contentProcessed { error in
                 if let error {
                     continuation.resume(throwing: error)
