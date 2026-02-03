@@ -1,7 +1,9 @@
 import os
 import tempfile
 import threading
+from html.parser import HTMLParser
 from urllib.parse import urljoin
+from urllib.request import urlopen, Request
 
 _LOCK = threading.Lock()
 _DEVICE = None
@@ -60,27 +62,47 @@ def connect(ip_address: str, key_path: str) -> str:
 def scan_url(url: str):
     _set_error("")
     try:
-        import requests
-        from bs4 import BeautifulSoup
+        class _ApkLinkParser(HTMLParser):
+            def __init__(self):
+                super().__init__()
+                self._current_href = None
+                self._current_text = []
+                self.items = []
 
-        response = requests.get(url, timeout=15)
-        response.raise_for_status()
+            def handle_starttag(self, tag, attrs):
+                if tag.lower() != "a":
+                    return
+                href = dict(attrs).get("href")
+                if href and href.lower().endswith(".apk"):
+                    self._current_href = href
+                    self._current_text = []
 
-        soup = BeautifulSoup(response.text, "html.parser")
-        results = []
+            def handle_data(self, data):
+                if self._current_href is not None:
+                    self._current_text.append(data)
 
-        for link in soup.find_all("a"):
-            href = link.get("href")
-            if not href:
-                continue
-            if not href.lower().endswith(".apk"):
-                continue
+            def handle_endtag(self, tag):
+                if tag.lower() != "a":
+                    return
+                if self._current_href is None:
+                    return
+                name = "".join(self._current_text).strip()
+                href = self._current_href
+                full_url = urljoin(url, href)
+                self.items.append({
+                    "name": name or os.path.basename(href),
+                    "url": full_url,
+                })
+                self._current_href = None
+                self._current_text = []
 
-            full_url = urljoin(url, href)
-            name = link.text.strip() or os.path.basename(href)
-            results.append({"name": name, "url": full_url})
+        request = Request(url, headers={"User-Agent": "Beamio/1.0"})
+        with urlopen(request, timeout=15) as response:
+            html = response.read().decode("utf-8", errors="replace")
 
-        return results
+        parser = _ApkLinkParser()
+        parser.feed(html)
+        return parser.items
     except Exception as exc:
         _set_error(str(exc))
         return []
@@ -89,8 +111,6 @@ def scan_url(url: str):
 def install_apk(url: str):
     _set_error("")
     try:
-        import requests
-
         with _LOCK:
             if _DEVICE is None:
                 yield "No device connected."
@@ -98,16 +118,16 @@ def install_apk(url: str):
             device = _DEVICE
 
         yield "Downloading APK..."
-        response = requests.get(url, stream=True, timeout=30)
-        response.raise_for_status()
-
         temp_dir = tempfile.mkdtemp(prefix="beamio_")
         apk_path = os.path.join(temp_dir, "payload.apk")
 
-        with open(apk_path, "wb") as apk_file:
-            for chunk in response.iter_content(chunk_size=1024 * 1024):
-                if chunk:
-                    apk_file.write(chunk)
+        request = Request(url, headers={"User-Agent": "Beamio/1.0"})
+        with urlopen(request, timeout=30) as response, open(apk_path, "wb") as apk_file:
+            while True:
+                chunk = response.read(1024 * 1024)
+                if not chunk:
+                    break
+                apk_file.write(chunk)
 
         yield "Installing APK..."
         device.install(apk_path)

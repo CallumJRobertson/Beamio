@@ -35,14 +35,44 @@ final class PythonManager: ObservableObject {
             return
         }
 
-        let sys = Python.import("sys")
-        if let resourcePath = Bundle.main.resourcePath {
-            sys.path.append(resourcePath)
-            sys.path.append("\(resourcePath)/site-packages")
+        do {
+            try PythonLibrary.loadLibrary()
+        } catch {
+            connectionStatus = "Python unavailable"
+            log("Failed to load Python library: \(error)")
+            return
         }
 
-        worker = Python.import("BeamioWorker")
-        log("Python environment initialized.")
+        do {
+            let sys = try Python.attemptImport("sys")
+            if let resourcePath = Bundle.main.resourcePath {
+                let stdlibPath = "\(resourcePath)/python3.13"
+                let stdlibZipPath = "\(resourcePath)/python3.13.zip"
+                let stdlibSitePackagesPath = "\(stdlibPath)/site-packages"
+
+                sys.path.append(resourcePath)
+                sys.path.append("\(resourcePath)/site-packages")
+                if FileManager.default.fileExists(atPath: stdlibPath) {
+                    sys.path.append(stdlibPath)
+                }
+                if FileManager.default.fileExists(atPath: stdlibSitePackagesPath) {
+                    sys.path.append(stdlibSitePackagesPath)
+                }
+                if FileManager.default.fileExists(atPath: stdlibZipPath) {
+                    sys.path.append(stdlibZipPath)
+                }
+                if !FileManager.default.fileExists(atPath: stdlibPath)
+                    && !FileManager.default.fileExists(atPath: stdlibZipPath) {
+                    log("Python stdlib not found. Bundle python3.13 or python3.13.zip in app resources.")
+                }
+            }
+
+            worker = try Python.attemptImport("BeamioWorker")
+            log("Python environment initialized.")
+        } catch {
+            connectionStatus = "Python unavailable"
+            log("Python import failed: \(error)")
+        }
     }
 
     private func pythonLibraryPath() -> String? {
