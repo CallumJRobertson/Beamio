@@ -53,12 +53,16 @@ final class PythonManager: ObservableObject {
             let sys = try Python.attemptImport("sys")
             if let resourcePath = Bundle.main.resourcePath {
                 let stdlibPath = "\(resourcePath)/python3.13.bundle"
+                let libDynloadPath = resolveLibDynloadPath(stdlibPath: stdlibPath)
                 let stdlibSitePackagesPath = "\(stdlibPath)/site-packages"
 
                 sys.path.append(resourcePath)
                 sys.path.append("\(resourcePath)/site-packages")
                 if FileManager.default.fileExists(atPath: stdlibPath) {
                     sys.path.append(stdlibPath)
+                }
+                if let libDynloadPath, FileManager.default.fileExists(atPath: libDynloadPath) {
+                    sys.path.append(libDynloadPath)
                 }
                 if FileManager.default.fileExists(atPath: stdlibSitePackagesPath) {
                     sys.path.append(stdlibSitePackagesPath)
@@ -79,12 +83,16 @@ final class PythonManager: ObservableObject {
 
     private func configurePythonEnvironment(resourcePath: String) {
         let stdlibPath = "\(resourcePath)/python3.13.bundle"
+        let libDynloadPath = resolveLibDynloadPath(stdlibPath: stdlibPath)
         let bundledSitePackages = "\(resourcePath)/site-packages"
         let stdlibSitePackages = "\(stdlibPath)/site-packages"
 
         var pythonPathEntries: [String] = []
         if FileManager.default.fileExists(atPath: stdlibPath) {
             pythonPathEntries.append(stdlibPath)
+        }
+        if let libDynloadPath, FileManager.default.fileExists(atPath: libDynloadPath) {
+            pythonPathEntries.append(libDynloadPath)
         }
         if FileManager.default.fileExists(atPath: bundledSitePackages) {
             pythonPathEntries.append(bundledSitePackages)
@@ -119,6 +127,22 @@ final class PythonManager: ObservableObject {
         }
 
         return nil
+    }
+
+    private func resolveLibDynloadPath(stdlibPath: String) -> String? {
+#if targetEnvironment(simulator)
+#if arch(arm64)
+        let candidate = "\(stdlibPath)/lib-dynload-sim-arm64"
+#elseif arch(x86_64)
+        let candidate = "\(stdlibPath)/lib-dynload-sim-x86_64"
+#else
+        let candidate = "\(stdlibPath)/lib-dynload"
+#endif
+#else
+        let candidate = "\(stdlibPath)/lib-dynload"
+#endif
+
+        return FileManager.default.fileExists(atPath: candidate) ? candidate : nil
     }
 
     func connect(ipAddress: String, keyStoragePath: String, completion: ((String) -> Void)? = nil) {
