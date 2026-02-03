@@ -128,6 +128,9 @@ final class ADBManager: ObservableObject {
     @Published var connectionTimeout: TimeInterval = 8.0
 
     private let maxLogLines = 800
+    private var isRefreshing = false
+    private var lastRefreshTime: Date?
+    private let refreshDebounceInterval: TimeInterval = 2.0
     private let workerQueue = DispatchQueue(label: "com.beamio.adb.worker", qos: .userInitiated)
     private let iconQueue = DispatchQueue(label: "com.beamio.adb.icon", qos: .utility)
     private var client: ADBClient?
@@ -269,7 +272,7 @@ final class ADBManager: ObservableObject {
             self.connect(ipAddress: self.lastConnectedIP, keyStoragePath: self.lastKeyStoragePath) { result in
                 if result == "Connected" {
                     self.reconnectAttempts = 0
-                    self.refreshApps(includeSystem: self.includeSystemApps)
+                    self.refreshApps(includeSystem: self.includeSystemApps, force: true)
                 }
             }
         }
@@ -450,17 +453,32 @@ final class ADBManager: ObservableObject {
         }
     }
 
-    func refreshApps(includeSystem: Bool? = nil) {
+    func refreshApps(includeSystem: Bool? = nil, force: Bool = false) {
         guard let client else {
             log("No device connected.")
             return
         }
 
+        // Debounce rapid refresh requests
+        if !force {
+            if isRefreshing {
+                log("Refresh already in progress, skipping...")
+                return
+            }
+            if let lastRefresh = lastRefreshTime,
+               Date().timeIntervalSince(lastRefresh) < refreshDebounceInterval {
+                log("Refresh debounced, too soon since last refresh")
+                return
+            }
+        }
+
         let shouldIncludeSystem = includeSystem ?? self.includeSystemApps
+        isRefreshing = true
         isLoadingApps = true
         appsError = nil
         iconLoadingCount = 0
         totalIconsToLoad = 0
+        lastRefreshTime = Date()
         log("Fetching installed apps...")
 
         workerQueue.async { [weak self] in
@@ -471,13 +489,18 @@ final class ADBManager: ObservableObject {
                     DispatchQueue.main.async {
                         self.apps = fetched
                         self.isLoadingApps = false
+                        self.isRefreshing = false
                         self.appsError = nil
                         self.log("Loaded \(fetched.count) apps.")
-                        self.preloadVisibleIcons()
+                        // Add a small delay before loading icons to let the UI settle
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                            self.preloadVisibleIcons()
+                        }
                     }
                 } catch {
                     DispatchQueue.main.async {
                         self.isLoadingApps = false
+                        self.isRefreshing = false
                         self.appsError = error.localizedDescription
                         self.log("App list failed: \(error.localizedDescription)")
                         self.log("Error: \(String(reflecting: error))")
@@ -495,10 +518,14 @@ final class ADBManager: ObservableObject {
         totalIconsToLoad = appsNeedingIcons.count
         iconLoadingCount = 0
 
-        let batchSize = 5
+        // Load icons one at a time with delays to prevent stream conflicts
+        let batchSize = 3
         let batch = Array(appsNeedingIcons.prefix(batchSize))
-        for app in batch {
-            loadIcon(for: app)
+        for (index, app) in batch.enumerated() {
+            // Stagger icon loads to prevent overwhelming the ADB connection
+            DispatchQueue.main.asyncAfter(deadline: .now() + Double(index) * 0.5) { [weak self] in
+                self?.loadIcon(for: app)
+            }
         }
     }
 
@@ -565,16 +592,21 @@ final class ADBManager: ObservableObject {
 
             Task {
                 do {
+                    // Resolve the actual APK file path
+                    // On newer Android versions, the path is a directory containing base.apk
+                    let resolvedPath = await self.resolveApkPath(apkPath, client: client)
+
                     let tempApkURL = FileManager.default.temporaryDirectory.appendingPathComponent("\(packageName).apk")
                     if FileManager.default.fileExists(atPath: tempApkURL.path) {
                         try? FileManager.default.removeItem(at: tempApkURL)
                     }
-                    try await client.pullFile(remotePath: apkPath, localURL: tempApkURL)
+                    try await client.pullFile(remotePath: resolvedPath, localURL: tempApkURL)
                     if let iconData = APKIconExtractor.extractIcon(from: tempApkURL) {
                         guard let finalData = self.normalizeIconData(iconData) else {
                             DispatchQueue.main.async {
                                 self.updateAppIconLoadingState(package: packageName, loading: false)
                             }
+                            self.endIconLoad(for: packageName)
                             return
                         }
                         try? FileManager.default.createDirectory(at: cacheURL.deletingLastPathComponent(), withIntermediateDirectories: true)
@@ -590,6 +622,7 @@ final class ADBManager: ObservableObject {
 
                     try? FileManager.default.removeItem(at: tempApkURL)
                 } catch {
+                    self.log("Icon load failed for \(packageName): \(error.localizedDescription)")
                     DispatchQueue.main.async {
                         self.updateAppIconLoadingState(package: packageName, loading: false)
                     }
@@ -601,6 +634,42 @@ final class ADBManager: ObservableObject {
                 self.endIconLoad(for: packageName)
             }
         }
+    }
+
+    private func resolveApkPath(_ path: String, client: ADBClient) async -> String {
+        // If the path already ends with .apk, use it directly
+        if path.lowercased().hasSuffix(".apk") {
+            return path
+        }
+
+        // On newer Android versions, pm list packages -f returns a directory path
+        // The actual APK is at base.apk inside that directory
+        let basePath = path.hasSuffix("/") ? path : path + "/"
+        let baseApkPath = basePath + "base.apk"
+
+        // Try to verify the base.apk exists
+        do {
+            let result = try await client.runShellCommand("ls \"\(baseApkPath)\" 2>/dev/null")
+            if result.trimmingCharacters(in: .whitespacesAndNewlines) == baseApkPath {
+                return baseApkPath
+            }
+        } catch {
+            // Silently fall through to try alternative paths
+        }
+
+        // Try to find any APK in the directory
+        do {
+            let result = try await client.runShellCommand("ls \"\(basePath)\"*.apk 2>/dev/null | head -1")
+            let trimmed = result.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty && trimmed.hasSuffix(".apk") {
+                return trimmed
+            }
+        } catch {
+            // Fall through
+        }
+
+        // Default to base.apk path
+        return baseApkPath
     }
 
     private func incrementIconLoadCount() {
@@ -885,10 +954,17 @@ private final class ADBClient {
         for line in packageLines {
             let trimmed = String(line).trimmingCharacters(in: .whitespacesAndNewlines)
             guard trimmed.hasPrefix("package:") else { continue }
-            let remainder = trimmed.dropFirst("package:".count)
-            let parts = remainder.split(separator: "=", maxSplits: 1).map(String.init)
-            guard parts.count == 2 else { continue }
-            packagePaths[parts[1]] = parts[0]
+            let remainder = String(trimmed.dropFirst("package:".count))
+
+            // Parse format: "path=packageName" where path may contain = characters
+            // Find the last = to separate path from package name
+            if let lastEqIndex = remainder.lastIndex(of: "=") {
+                let path = String(remainder[remainder.startIndex..<lastEqIndex])
+                let packageName = String(remainder[remainder.index(after: lastEqIndex)...])
+                if !path.isEmpty && !packageName.isEmpty {
+                    packagePaths[packageName] = path
+                }
+            }
         }
 
         var installers: [String: String] = [:]
@@ -932,6 +1008,8 @@ private final class ADBClient {
         var apps: [AppInfo] = []
 
         for package in targetPackages.sorted() {
+            // Add a small delay between package detail fetches to prevent stream conflicts
+            try? await Task.sleep(nanoseconds: 50_000_000) // 50ms
             let details = try? await fetchPackageDetails(package)
             let apkPath = packagePaths[package] ?? details?.codePath
             let installer = installers[package] ?? details?.installer
@@ -1011,9 +1089,14 @@ private final class ADBClient {
         return String(data: data, encoding: .utf8) ?? ""
     }
 
-    private func runShellOptional(_ command: String) async -> String {
+    private func runShellOptional(_ command: String, delay: UInt64 = 100_000_000) async -> String {
         do {
-            return try await runShell(command)
+            let result = try await runShell(command)
+            // Small delay to let the ADB connection settle between commands
+            if delay > 0 {
+                try? await Task.sleep(nanoseconds: delay)
+            }
+            return result
         } catch {
             trace("Shell command failed (\(command)): \(error.localizedDescription)")
             return ""
