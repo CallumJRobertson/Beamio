@@ -587,8 +587,11 @@ private final class ADBClient {
 
     func fetchInstalledApps(includeSystem: Bool) async throws -> [AppInfo] {
         let packagePathsOutput = try await runShell("pm list packages -f")
-        let installerOutput = try await runShell("cmd package list packages -i")
-        let userOutput = try await runShell("pm list packages -3")
+        var installerOutput = await runShellOptional("pm list packages -i")
+        if installerOutput.isEmpty {
+            installerOutput = await runShellOptional("cmd package list packages -i")
+        }
+        let userOutput = await runShellOptional("pm list packages -3")
 
         var packagePaths: [String: String] = [:]
         for line in packagePathsOutput.split(separator: "\n") {
@@ -618,7 +621,14 @@ private final class ADBClient {
             userPackages.insert(trimmed.dropFirst("package:".count).trimmingCharacters(in: .whitespaces))
         }
 
-        let targetPackages = includeSystem ? Array(packagePaths.keys) : Array(userPackages)
+        let targetPackages: [String]
+        if includeSystem {
+            targetPackages = Array(packagePaths.keys)
+        } else if userPackages.isEmpty {
+            targetPackages = Array(packagePaths.keys)
+        } else {
+            targetPackages = Array(userPackages)
+        }
         var apps: [AppInfo] = []
 
         for package in targetPackages.sorted() {
@@ -669,6 +679,15 @@ private final class ADBClient {
         let stream = try await openStream(service: "shell:\(command)")
         let data = try await readStreamUntilClose(stream)
         return String(data: data, encoding: .utf8) ?? ""
+    }
+
+    private func runShellOptional(_ command: String) async -> String {
+        do {
+            return try await runShell(command)
+        } catch {
+            trace("Shell command failed (\(command)): \(error.localizedDescription)")
+            return ""
+        }
     }
 
     func sendKeyEvent(_ keyCode: Int) async throws {
