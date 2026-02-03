@@ -1,4 +1,5 @@
 import SwiftUI
+import UniformTypeIdentifiers
 
 struct DashboardView: View {
     @EnvironmentObject private var adbManager: ADBManager
@@ -7,6 +8,9 @@ struct DashboardView: View {
 
     @State private var apkItems: [ApkItem] = []
     @State private var selectedApk: ApkItem?
+    @State private var directApkURL: String = ""
+    @State private var showFileImporter = false
+    @State private var fileImportError: String?
 
     private var keyStoragePath: String {
         let url = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
@@ -62,6 +66,52 @@ struct DashboardView: View {
             .buttonStyle(.bordered)
             .disabled(updateURL.isEmpty)
 
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Direct APK Link")
+                    .font(.headline)
+                TextField("https://example.com/app.apk", text: $directApkURL)
+                    .keyboardType(.URL)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+
+                HStack {
+                    Button {
+                        let trimmed = directApkURL.trimmingCharacters(in: .whitespacesAndNewlines)
+                        guard !trimmed.isEmpty else { return }
+                        let displayName = URL(string: trimmed)?.lastPathComponent ?? "Direct APK"
+                        if !apkItems.contains(where: { $0.url == trimmed }) {
+                            let item = ApkItem(name: displayName, url: trimmed)
+                            apkItems.insert(item, at: 0)
+                            selectedApk = item
+                        } else {
+                            selectedApk = apkItems.first(where: { $0.url == trimmed })
+                        }
+                    } label: {
+                        Label("Add to List", systemImage: "plus.circle")
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(directApkURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+
+                    Button {
+                        let trimmed = directApkURL.trimmingCharacters(in: .whitespacesAndNewlines)
+                        guard !trimmed.isEmpty else { return }
+                        adbManager.installApk(from: trimmed)
+                    } label: {
+                        Label("Install Link", systemImage: "square.and.arrow.down")
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(directApkURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+
+            Button {
+                showFileImporter = true
+            } label: {
+                Label("Install from File", systemImage: "doc.badge.plus")
+            }
+            .buttonStyle(.bordered)
+
             Button {
                 if let selectedApk {
                     adbManager.installApk(from: selectedApk.url)
@@ -71,8 +121,29 @@ struct DashboardView: View {
             }
             .buttonStyle(.bordered)
             .disabled(selectedApk == nil)
+
+            if let fileImportError {
+                Text(fileImportError)
+                    .font(.caption)
+                    .foregroundColor(.red)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
         }
         .frame(maxWidth: .infinity)
+        .fileImporter(
+            isPresented: $showFileImporter,
+            allowedContentTypes: apkContentTypes,
+            allowsMultipleSelection: false
+        ) { result in
+            switch result {
+            case .success(let urls):
+                guard let url = urls.first else { return }
+                fileImportError = nil
+                adbManager.installApkFile(url)
+            case .failure(let error):
+                fileImportError = "File import failed: \(error.localizedDescription)"
+            }
+        }
     }
 
     private var apkListSection: some View {
@@ -117,6 +188,13 @@ struct DashboardView: View {
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private var apkContentTypes: [UTType] {
+        if let apk = UTType(filenameExtension: "apk") {
+            return [apk, .data]
+        }
+        return [.data]
     }
 }
 

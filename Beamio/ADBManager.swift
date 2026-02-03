@@ -186,6 +186,52 @@ final class ADBManager: ObservableObject {
         }.resume()
     }
 
+    func installApkFile(_ fileURL: URL) {
+        log("Starting install from file \(fileURL.lastPathComponent)...")
+        guard let client else {
+            log("No device connected.")
+            return
+        }
+
+        workerQueue.async {
+            Task {
+                let didAccess = fileURL.startAccessingSecurityScopedResource()
+                defer {
+                    if didAccess {
+                        fileURL.stopAccessingSecurityScopedResource()
+                    }
+                }
+
+                let targetURL = FileManager.default.temporaryDirectory.appendingPathComponent("beamio_payload.apk")
+                do {
+                    if FileManager.default.fileExists(atPath: targetURL.path) {
+                        try FileManager.default.removeItem(at: targetURL)
+                    }
+                    try FileManager.default.copyItem(at: fileURL, to: targetURL)
+                } catch {
+                    DispatchQueue.main.async {
+                        self.log("Failed to read APK file: \(error.localizedDescription)")
+                        self.log("Error: \(String(reflecting: error))")
+                    }
+                    return
+                }
+
+                do {
+                    try await client.installApk(at: targetURL) { [weak self] update in
+                        DispatchQueue.main.async {
+                            self?.log(update)
+                        }
+                    }
+                } catch {
+                    DispatchQueue.main.async {
+                        self.log("Install failed: \(error.localizedDescription)")
+                        self.log("Error: \(String(reflecting: error))")
+                    }
+                }
+            }
+        }
+    }
+
     private static func parseApkLinks(from html: String, baseURL: URL) -> [ApkItem] {
         let pattern = "<a\\s+[^>]*href=[\"']([^\"']+\\.apk)[\"'][^>]*>(.*?)</a>"
         let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive])
@@ -275,6 +321,7 @@ private final class ADBClient {
     private var keyPair: ADBKeyPair?
     private var maxData: Int = 4096
     private var dataPacketCount: Int = 0
+    private var okayPacketCount: Int = 0
 
     init(logger: ((String) -> Void)? = nil) {
         self.logger = logger
@@ -586,6 +633,14 @@ private final class ADBClient {
     }
 
     private func tracePacket(direction: String, command: ADBCommand, arg0: UInt32, arg1: UInt32, length: UInt32, checksum: UInt32, data: Data) {
+        if command == .okay {
+            okayPacketCount += 1
+            if okayPacketCount <= 5 || okayPacketCount % 50 == 0 {
+                trace("\(direction) \(command.name) arg0=\(arg0) arg1=\(arg1) len=\(length)")
+            }
+            return
+        }
+
         if command == .wrte, let syncId = syncCommandId(from: data) {
             if syncId == "DATA" {
                 dataPacketCount += 1
