@@ -1,5 +1,2 @@
-*.xcframework
-**/site-packages
 build/
-*.ipa
-*.app
+*.DS_Store

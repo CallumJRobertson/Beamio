@@ -46,7 +46,7 @@ final class PythonManager: ObservableObject {
         workerQueue.async { [weak self] in
             guard let self else { return }
             let resultObject = worker?.connect(ipAddress, keyStoragePath)
-            let result = resultObject.map { String($0) } ?? "Connection failed"
+            let result = resultObject.flatMap { String($0) } ?? "Connection failed"
 
             DispatchQueue.main.async {
                 self.connectionStatus = result
