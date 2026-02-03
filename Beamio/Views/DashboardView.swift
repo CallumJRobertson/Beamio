@@ -182,18 +182,22 @@ private struct AppRow: View {
     private func manualIconUrl(for package: String) -> URL? {
         let map: [String: String] = [
             "com.netflix.ninja": "https://img.icons8.com/color/96/netflix.png",
+            "com.netflix.mediaclient": "https://img.icons8.com/color/96/netflix.png",
             "com.google.android.youtube": "https://img.icons8.com/color/96/youtube-play.png",
             "com.google.android.youtube.tv": "https://img.icons8.com/color/96/youtube-play.png",
             "com.stremio.android": "https://img.icons8.com/external-others-pike-picture/96/stremio.png",
             "org.videolan.vlc": "https://img.icons8.com/color/96/vlc.png",
             "com.amazon.avod": "https://img.icons8.com/fluency/96/amazon-prime-video.png",
-            "com.amazon.avls.experience": "https://img.icons8.com/fluency/96/amazon-prime-video.png",
-            "com.amzn.firebat": "https://img.icons8.com/fluency/96/amazfit.png",
+            "com.amazon.avs": "https://img.icons8.com/fluency/96/amazon-prime-video.png",
+            "com.spotify.tv.android": "https://img.icons8.com/color/96/spotify.png",
+            "com.hulu.plus": "https://img.icons8.com/color/96/hulu.png",
+            "com.emerson.youtube": "https://img.icons8.com/color/96/youtube-play.png",
+            "com.mxtech.videoplayer.ad": "https://img.icons8.com/color/96/video.png",
+            "com.pandora.android": "https://img.icons8.com/color/96/pandora.png",
+            "com.amazon.firebat": "https://img.icons8.com/fluency/96/amazfit.png",
             "com.amazon.hedwig": "https://img.icons8.com/color/96/amazon-alexa.png",
             "com.amazon.cloud9": "https://img.icons8.com/color/96/amazon-s3.png",
-            "com.amazon.fireos.webapp": "https://img.icons8.com/color/96/amazon.png",
-            "com.spotify.tv.android": "https://img.icons8.com/color/96/spotify.png",
-            "com.hulu.plus": "https://img.icons8.com/color/96/hulu.png"
+            "com.amazon.fireos.webapp": "https://img.icons8.com/color/96/amazon.png"
         ]
         guard let urlString = map[package] else { return nil }
         return URL(string: urlString)

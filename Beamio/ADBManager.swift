@@ -705,6 +705,10 @@ private final class ADBClient {
                 isSystem = false
             }
 
+            if isExcludedPackage(package) {
+                continue
+            }
+
             if !includeSystem, isSystem {
                 continue
             }
@@ -879,6 +883,26 @@ private final class ADBClient {
             return true
         }
         return false
+    }
+
+    private func isExcludedPackage(_ package: String) -> Bool {
+        let normalized = package.lowercased()
+        let excluded: Set<String> = [
+            "alexa.datastore.app",
+            "alexamediaplayer.runtime.ftv",
+            "amazon.avls.experience",
+            "amazon.cloud9",
+            "amazon.firebat",
+            "amazon.hedwig",
+            "amazon.rialto.dordova",
+            "amazon.shoptv.client",
+            "com.amazon.avls.experience",
+            "com.amazon.cloud9",
+            "com.amazon.firebat",
+            "com.amazon.hedwig",
+            "com.amazon.hedwig.something"
+        ]
+        return excluded.contains(normalized)
     }
 
     private func enqueue<T>(_ operation: @escaping () async throws -> T) async throws -> T {
