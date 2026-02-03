@@ -19,6 +19,7 @@ final class PythonManager: ObservableObject {
 
     private var worker: PythonObject?
     private var isInitialized = false
+    private let workerQueue = DispatchQueue(label: "com.beamio.python.worker", qos: .userInitiated)
 
     private init() {}
 
@@ -37,11 +38,12 @@ final class PythonManager: ObservableObject {
     }
 
     func connect(ipAddress: String, keyStoragePath: String, completion: ((String) -> Void)? = nil) {
+        initializeIfNeeded()
         connectionStatus = "Connecting..."
         log("Connecting to \(ipAddress)...")
 
         let worker = worker
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+        workerQueue.async { [weak self] in
             guard let self else { return }
             let resultObject = worker?.connect(ipAddress, keyStoragePath)
             let result = resultObject.map { String($0) } ?? "Connection failed"
@@ -55,9 +57,10 @@ final class PythonManager: ObservableObject {
     }
 
     func scanURL(_ url: String, completion: @escaping ([ApkItem]) -> Void) {
+        initializeIfNeeded()
         log("Scanning \(url)...")
         let worker = worker
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+        workerQueue.async { [weak self] in
             guard let self else { return }
             var items: [ApkItem] = []
 
@@ -81,9 +84,10 @@ final class PythonManager: ObservableObject {
     }
 
     func installApk(from url: String) {
+        initializeIfNeeded()
         log("Starting install from \(url)...")
         let worker = worker
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+        workerQueue.async { [weak self] in
             guard let self else { return }
 
             guard let stream = worker?.install_apk(url) else {

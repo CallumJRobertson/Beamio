@@ -13,24 +13,27 @@ _LOCK = threading.Lock()
 _DEVICE = None
 
 
-def _ensure_keys(key_storage_path: str) -> str:
-    os.makedirs(key_storage_path, exist_ok=True)
-    key_path = os.path.join(key_storage_path, "adbkey")
-    if not os.path.exists(key_path):
-        keygen(key_path)
-    return key_path
+def _resolve_key_path(key_path: str) -> str:
+    if os.path.isdir(key_path):
+        resolved_path = os.path.join(key_path, "adbkey")
+    else:
+        resolved_path = key_path
+    os.makedirs(os.path.dirname(resolved_path) or ".", exist_ok=True)
+    if not os.path.exists(resolved_path):
+        keygen(resolved_path)
+    return resolved_path
 
 
-def connect(ip_address: str, key_storage_path: str) -> str:
+def connect(ip_address: str, key_path: str) -> str:
     global _DEVICE
     if ip_address == "127.0.0.1":
         return "Connected (Simulation)"
 
     with _LOCK:
-        key_path = _ensure_keys(key_storage_path)
-        with open(key_path, "r", encoding="utf-8") as key_file:
+        resolved_key_path = _resolve_key_path(key_path)
+        with open(resolved_key_path, "r", encoding="utf-8") as key_file:
             private_key = key_file.read()
-        with open(f"{key_path}.pub", "r", encoding="utf-8") as pub_file:
+        with open(f"{resolved_key_path}.pub", "r", encoding="utf-8") as pub_file:
             public_key = pub_file.read()
 
         signer = PythonRSASigner(public_key, private_key)
