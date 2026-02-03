@@ -1,6 +1,7 @@
 import Foundation
 import Network
 import Security
+import UIKit
 
 struct ApkItem: Identifiable, Hashable {
     let id = UUID()
@@ -69,6 +70,7 @@ final class ADBManager: ObservableObject {
     @Published var apps: [AppInfo] = []
     @Published var isLoadingApps: Bool = false
     @Published var appsError: String? = nil
+    @Published var isConnected: Bool = false
 
     private let maxLogLines = 800
     private let workerQueue = DispatchQueue(label: "com.beamio.adb.worker", qos: .userInitiated)
@@ -99,9 +101,11 @@ final class ADBManager: ObservableObject {
                     try await client.connect(host: host, port: port, keyStoragePath: keyStoragePath)
                     self.client = client
                     result = "Connected"
+                    self.isConnected = true
                 } catch {
                     self.client = nil
                     result = "Connection failed"
+                    self.isConnected = false
                     self.log("\(result): \(error.localizedDescription)")
                     self.log("Error: \(String(reflecting: error))")
                 }
@@ -337,10 +341,20 @@ final class ADBManager: ObservableObject {
                     }
                     try await client.pullFile(remotePath: apkPath, localURL: tempApkURL)
                     if let iconData = APKIconExtractor.extractIcon(from: tempApkURL) {
+                        guard let finalData = self.normalizeIconData(iconData) else {
+                            DispatchQueue.main.async {
+                                self.log("Icon decode failed for \(packageName).")
+                            }
+                            return
+                        }
                         try? FileManager.default.createDirectory(at: cacheURL.deletingLastPathComponent(), withIntermediateDirectories: true)
-                        try? iconData.write(to: cacheURL)
+                        try? finalData.write(to: cacheURL)
                         DispatchQueue.main.async {
-                            self.updateAppIcon(package: packageName, data: iconData)
+                            self.updateAppIcon(package: packageName, data: finalData)
+                        }
+                    } else {
+                        DispatchQueue.main.async {
+                            self.log("Icon not found for \(packageName).")
                         }
                     }
                 } catch {
@@ -511,6 +525,11 @@ final class ADBManager: ObservableObject {
         return dir.appendingPathComponent("\(package).png")
     }
 
+    private func normalizeIconData(_ data: Data) -> Data? {
+        guard let image = UIImage(data: data) else { return nil }
+        return image.pngData()
+    }
+
     private func loadUpdateSources() {
         guard let data = UserDefaults.standard.data(forKey: updateSourcesKey) else {
             updateSources = [:]
@@ -538,12 +557,19 @@ private final class ADBClient {
     private var maxData: Int = 4096
     private var dataPacketCount: Int = 0
     private var okayPacketCount: Int = 0
+    private let opQueue = ADBOperationQueue()
 
     init(logger: ((String) -> Void)? = nil) {
         self.logger = logger
     }
 
     func connect(host: String, port: UInt16, keyStoragePath: String) async throws {
+        try await enqueue {
+            try await self.performConnect(host: host, port: port, keyStoragePath: keyStoragePath)
+        }
+    }
+
+    private func performConnect(host: String, port: UInt16, keyStoragePath: String) async throws {
         guard !host.isEmpty else { throw ADBError.invalidHost }
 
         let connection = ADBConnection(host: host, port: port, logger: logger)
@@ -586,15 +612,29 @@ private final class ADBClient {
     }
 
     func fetchInstalledApps(includeSystem: Bool) async throws -> [AppInfo] {
-        let packagePathsOutput = try await runShell("pm list packages -f")
-        var installerOutput = await runShellOptional("pm list packages -i")
-        if installerOutput.isEmpty {
-            installerOutput = await runShellOptional("cmd package list packages -i")
+        try await enqueue {
+            try await self.performFetchInstalledApps(includeSystem: includeSystem)
         }
-        let userOutput = await runShellOptional("pm list packages -3")
+    }
+
+    private func performFetchInstalledApps(includeSystem: Bool) async throws -> [AppInfo] {
+        let primaryPackagePaths = await runShellOptional("cmd package list packages -3 -f")
+        let secondaryPackagePaths = primaryPackagePaths.isEmpty ? await runShellOptional("pm list packages -3 -f") : ""
+        let allPackagePaths = primaryPackagePaths.isEmpty && secondaryPackagePaths.isEmpty
+            ? (try await runShell("pm list packages -f"))
+            : (primaryPackagePaths.isEmpty ? secondaryPackagePaths : primaryPackagePaths)
+
+        var installerOutput = await runShellOptional("cmd package list packages -3 -i")
+        if installerOutput.isEmpty { installerOutput = await runShellOptional("pm list packages -3 -i") }
+        if installerOutput.isEmpty { installerOutput = await runShellOptional("cmd package list packages -i") }
+        if installerOutput.isEmpty { installerOutput = await runShellOptional("pm list packages -i") }
+
+        var userOutput = await runShellOptional("cmd package list packages -3")
+        if userOutput.isEmpty { userOutput = await runShellOptional("pm list packages -3") }
 
         var packagePaths: [String: String] = [:]
-        for line in packagePathsOutput.split(separator: "\n") {
+        let packageLines = allPackagePaths.split(separator: "\n")
+        for line in packageLines {
             let trimmed = String(line).trimmingCharacters(in: .whitespacesAndNewlines)
             guard trimmed.hasPrefix("package:") else { continue }
             let remainder = trimmed.dropFirst("package:".count)
@@ -610,7 +650,9 @@ private final class ADBClient {
             let remainder = trimmed.dropFirst("package:".count)
             let parts = remainder.split(separator: "installer=", maxSplits: 1).map(String.init)
             if parts.count == 2 {
-                installers[parts[0].trimmingCharacters(in: .whitespaces)] = parts[1].trimmingCharacters(in: .whitespaces)
+                let installerValue = parts[1].trimmingCharacters(in: .whitespacesAndNewlines)
+                if installerValue.isEmpty || installerValue == "null" { continue }
+                installers[parts[0].trimmingCharacters(in: .whitespaces)] = installerValue
             }
         }
 
@@ -624,27 +666,39 @@ private final class ADBClient {
         let targetPackages: [String]
         if includeSystem {
             targetPackages = Array(packagePaths.keys)
-        } else if userPackages.isEmpty {
+        } else if !primaryPackagePaths.isEmpty || !secondaryPackagePaths.isEmpty {
+            targetPackages = Array(packagePaths.keys)
+        } else if !userPackages.isEmpty {
+            targetPackages = Array(userPackages)
+        } else {
             targetPackages = packagePaths.compactMap { (package, path) in
                 isLikelyUserApp(path: path) ? package : nil
             }
-        } else {
-            targetPackages = Array(userPackages)
         }
         var apps: [AppInfo] = []
 
         for package in targetPackages.sorted() {
-            let apkPath = packagePaths[package]
             let details = try? await fetchPackageDetails(package)
+            let apkPath = packagePaths[package] ?? details?.codePath
             let installer = installers[package] ?? details?.installer
 
             let isSystem: Bool
-            if !userPackages.isEmpty {
+            if includeSystem {
+                isSystem = details?.isSystem ?? false
+            } else if let detailsSystem = details?.isSystem {
+                isSystem = detailsSystem
+            } else if let path = details?.codePath {
+                isSystem = isSystemPath(path)
+            } else if !userPackages.isEmpty {
                 isSystem = !userPackages.contains(package)
             } else if let path = apkPath {
                 isSystem = !isLikelyUserApp(path: path)
             } else {
                 isSystem = false
+            }
+
+            if !includeSystem, isSystem {
+                continue
             }
             let label = details?.label?.isEmpty == false ? details!.label! : package
             let versionName = details?.versionName
@@ -665,6 +719,12 @@ private final class ADBClient {
     }
 
     func installApk(at localURL: URL, progress: @escaping (String, Double?) -> Void) async throws {
+        try await enqueue {
+            try await self.performInstallApk(at: localURL, progress: progress)
+        }
+    }
+
+    private func performInstallApk(at localURL: URL, progress: @escaping (String, Double?) -> Void) async throws {
         progress("Uploading APK...", 0)
         try await pushFile(localURL: localURL, remotePath: "/data/local/tmp/beamio_payload.apk", mode: 0o644) { sent, total in
             if let total, total > 0 {
@@ -701,54 +761,109 @@ private final class ADBClient {
     }
 
     func sendKeyEvent(_ keyCode: Int) async throws {
-        _ = try await runShell("input keyevent \(keyCode)")
+        try await enqueue {
+            _ = try await self.runShell("input keyevent \(keyCode)")
+        }
     }
 
-    private func fetchPackageDetails(_ package: String) async throws -> (label: String?, versionName: String?, installer: String?) {
+    private func fetchPackageDetails(_ package: String) async throws -> (label: String?, versionName: String?, installer: String?, isSystem: Bool?, codePath: String?) {
         let output = try await runShell("dumpsys package \(package)")
         var label: String?
         var versionName: String?
         var installer: String?
+        var isSystem: Bool?
+        var codePath: String?
+        var resourcePath: String?
 
         for rawLine in output.split(separator: "\n") {
             let line = String(rawLine).trimmingCharacters(in: .whitespacesAndNewlines)
             if versionName == nil, let range = line.range(of: "versionName=") {
                 versionName = String(line[range.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
             }
-            if label == nil, line.hasPrefix("application-label:") {
-                label = line.replacingOccurrences(of: "application-label:", with: "").trimmingCharacters(in: .whitespacesAndNewlines)
+            if label == nil, line.hasPrefix("application-label") {
+                if let colon = line.firstIndex(of: ":") {
+                    label = String(line[line.index(after: colon)...]).trimmingCharacters(in: .whitespacesAndNewlines)
+                }
             }
             if installer == nil, let installerValue = parseInstaller(from: line) {
                 installer = installerValue
             }
-            if versionName != nil, label != nil, installer != nil {
+            if isSystem == nil, line.contains("flags=[") {
+                if line.contains("SYSTEM") || line.contains("UPDATED_SYSTEM_APP") {
+                    isSystem = true
+                } else {
+                    isSystem = false
+                }
+            }
+            if codePath == nil, line.hasPrefix("codePath=") {
+                codePath = line.replacingOccurrences(of: "codePath=", with: "").trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+            if resourcePath == nil, line.hasPrefix("resourcePath=") {
+                resourcePath = line.replacingOccurrences(of: "resourcePath=", with: "").trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+
+            if versionName != nil, label != nil, installer != nil, isSystem != nil, codePath != nil {
                 break
             }
         }
 
-        return (label, versionName, installer)
+        let effectivePath = codePath ?? resourcePath
+        if isSystem == nil, let effectivePath {
+            isSystem = isSystemPath(effectivePath)
+        }
+
+        return (label, versionName, installer, isSystem, effectivePath)
     }
 
     private func parseInstaller(from line: String) -> String? {
-        guard let range = line.range(of: "installerPackageName=") else { return nil }
-        let value = line[range.upperBound...]
-        let trimmed = value.split(whereSeparator: { $0 == " " || $0 == "}" || $0 == "," }).first
-        let result = trimmed.map(String.init)?.trimmingCharacters(in: .whitespacesAndNewlines)
-        if result == nil || result == "" || result == "null" {
-            return nil
+        let keys = [
+            "installerPackageName=",
+            "installInitiator=",
+            "installOriginator=",
+            "installer="
+        ]
+        for key in keys {
+            guard let range = line.range(of: key) else { continue }
+            let value = line[range.upperBound...]
+            let trimmed = value.split(whereSeparator: { $0 == " " || $0 == "}" || $0 == "," }).first
+            let result = trimmed.map(String.init)?.trimmingCharacters(in: .whitespacesAndNewlines)
+            if let result, !result.isEmpty, result != "null" {
+                return result
+            }
         }
-        return result
+        return nil
     }
 
     private func isLikelyUserApp(path: String) -> Bool {
         let lower = path.lowercased()
-        if lower.hasPrefix("/data/app/") || lower.hasPrefix("/data/user/") {
-            return true
-        }
-        if lower.hasPrefix("/data/") {
+        if lower.hasPrefix("/data/app/") || lower.hasPrefix("/data/user/") || lower.hasPrefix("/mnt/expand/") {
             return true
         }
         return false
+    }
+
+    private func isSystemPath(_ path: String) -> Bool {
+        let lower = path.lowercased()
+        let systemPrefixes = [
+            "/system/",
+            "/system_ext/",
+            "/product/",
+            "/vendor/",
+            "/apex/",
+            "/odm/",
+            "/oem/",
+            "/cust/"
+        ]
+        if systemPrefixes.contains(where: { lower.hasPrefix($0) }) {
+            return true
+        }
+        return false
+    }
+
+    private func enqueue<T>(_ operation: @escaping () async throws -> T) async throws -> T {
+        await opQueue.acquire()
+        defer { Task { await opQueue.release() } }
+        return try await operation()
     }
 
     private func pushFile(localURL: URL, remotePath: String, mode: Int, progress: ((Int64, Int64?) -> Void)? = nil) async throws {
@@ -864,6 +979,12 @@ private final class ADBClient {
     }
 
     func pullFile(remotePath: String, localURL: URL) async throws {
+        try await enqueue {
+            try await self.performPullFile(remotePath: remotePath, localURL: localURL)
+        }
+    }
+
+    private func performPullFile(remotePath: String, localURL: URL) async throws {
         let stream = try await openStream(service: "sync:")
         var buffer = Data()
         var bufferOffset = 0
@@ -1116,6 +1237,30 @@ private final class ADBClient {
 private struct ADBStream {
     let localId: UInt32
     let remoteId: UInt32
+}
+
+private actor ADBOperationQueue {
+    private var isBusy = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    func acquire() async {
+        if !isBusy {
+            isBusy = true
+            return
+        }
+        await withCheckedContinuation { continuation in
+            waiters.append(continuation)
+        }
+    }
+
+    func release() {
+        if waiters.isEmpty {
+            isBusy = false
+        } else {
+            let continuation = waiters.removeFirst()
+            continuation.resume()
+        }
+    }
 }
 
 private enum ADBCommand: UInt32 {

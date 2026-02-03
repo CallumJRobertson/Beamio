@@ -3,17 +3,23 @@ import SwiftUI
 struct ContentView: View {
     var body: some View {
         TabView {
-            DashboardView()
+            ConnectionGate {
+                DashboardView()
+            }
                 .tabItem {
                     Label("Apps", systemImage: "square.grid.2x2")
                 }
 
-            InstallView()
+            ConnectionGate {
+                InstallView()
+            }
                 .tabItem {
                     Label("Install", systemImage: "square.and.arrow.down")
                 }
 
-            RemoteView()
+            ConnectionGate {
+                RemoteView()
+            }
                 .tabItem {
                     Label("Remote", systemImage: "appletvremote.gen1")
                 }

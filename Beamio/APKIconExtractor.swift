@@ -1,5 +1,5 @@
 import Foundation
-import Compression
+import zlib
 
 enum APKIconExtractor {
     static func extractIcon(from apkURL: URL) -> Data? {
@@ -39,6 +39,12 @@ enum APKIconExtractor {
         }
         if name.contains("ic_launcher_foreground") {
             score += 200
+        }
+        if name.contains("app_icon") || name.contains("appicon") {
+            score += 400
+        }
+        if name.contains("icon") || name.contains("logo") {
+            score += 150
         }
 
         if name.contains("xxxhdpi") { score += 500 }
@@ -165,21 +171,35 @@ final class ZipArchive {
 
 private func decompressDeflate(_ data: Data, expectedSize: Int) -> Data? {
     guard expectedSize > 0 else { return Data() }
+
+    var stream = z_stream()
+    var result = inflateInit2_(&stream, -MAX_WBITS, ZLIB_VERSION, Int32(MemoryLayout<z_stream>.size))
+    guard result == Z_OK else { return nil }
+    defer { inflateEnd(&stream) }
+
     var output = Data(count: expectedSize)
-    let decoded = output.withUnsafeMutableBytes { destPtr in
-        data.withUnsafeBytes { srcPtr in
-            compression_decode_buffer(
-                destPtr.bindMemory(to: UInt8.self).baseAddress!,
-                expectedSize,
-                srcPtr.bindMemory(to: UInt8.self).baseAddress!,
-                data.count,
-                nil,
-                COMPRESSION_ZLIB
-            )
+    var decodedSize = 0
+
+    let status: Int32 = data.withUnsafeBytes { inputPtr in
+        output.withUnsafeMutableBytes { outputPtr in
+            guard let inBase = inputPtr.bindMemory(to: Bytef.self).baseAddress,
+                  let outBase = outputPtr.bindMemory(to: Bytef.self).baseAddress else {
+                return Z_DATA_ERROR
+            }
+
+            stream.next_in = UnsafeMutablePointer<Bytef>(mutating: inBase)
+            stream.avail_in = uInt(data.count)
+            stream.next_out = outBase
+            stream.avail_out = uInt(expectedSize)
+
+            let inflateResult = inflate(&stream, Z_FINISH)
+            decodedSize = expectedSize - Int(stream.avail_out)
+            return inflateResult
         }
     }
-    guard decoded > 0 else { return nil }
-    output.count = decoded
+
+    guard status == Z_STREAM_END || status == Z_OK else { return nil }
+    output.count = max(decodedSize, 0)
     return output
 }
 

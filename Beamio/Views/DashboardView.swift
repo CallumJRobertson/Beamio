@@ -4,15 +4,9 @@ import UniformTypeIdentifiers
 
 struct DashboardView: View {
     @EnvironmentObject private var adbManager: ADBManager
-    @AppStorage("fireTVIP") private var fireTVIP: String = ""
 
     @State private var searchText: String = ""
     @State private var selectedApp: AppInfo?
-
-    private var keyStoragePath: String {
-        let url = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
-        return url?.path ?? NSTemporaryDirectory()
-    }
 
     private var filteredApps: [AppInfo] {
         let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -24,17 +18,43 @@ struct DashboardView: View {
     }
 
     var body: some View {
-        NavigationView {
-            VStack(spacing: 16) {
-                connectionSection
-                installStatusSection
-                actionsSection
-                appsSection
+        NavigationStack {
+            ZStack {
+                AppBackground()
+
+                ScrollView {
+                    VStack(spacing: 20) {
+                        headerSection
+                        ConnectionPanel()
+
+                        installStatusCard
+
+                        appsListCard
+                    }
+                    .padding(.horizontal, 20)
+                    .padding(.bottom, 32)
+                }
             }
-            .padding()
-            .navigationTitle("Apps")
+            .navigationTitle("")
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button {
+                        adbManager.refreshApps()
+                    } label: {
+                        Image(systemName: "arrow.clockwise")
+                    }
+                    .disabled(adbManager.isLoadingApps)
+                    .accessibilityLabel("Refresh Apps")
+                }
+            }
+            .searchable(text: $searchText, placement: .navigationBarDrawer(displayMode: .automatic))
             .onAppear {
                 if adbManager.apps.isEmpty {
+                    adbManager.refreshApps()
+                }
+            }
+            .onChange(of: adbManager.isConnected) { isConnected in
+                if isConnected {
                     adbManager.refreshApps()
                 }
             }
@@ -45,96 +65,86 @@ struct DashboardView: View {
         }
     }
 
-    private var connectionSection: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Text("Connection")
-                .font(.headline)
-            Text(adbManager.connectionStatus)
-                .font(.subheadline)
+    private var headerSection: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("Apps")
+                .font(BeamioTheme.titleFont(28))
+            Text("Manage your installed apps and keep sideloaded builds updated.")
+                .font(BeamioTheme.bodyFont(14))
                 .foregroundColor(.secondary)
-            Button {
-                adbManager.connect(ipAddress: fireTVIP, keyStoragePath: keyStoragePath)
-            } label: {
-                Label("Connect", systemImage: "dot.radiowaves.left.and.right")
-            }
-            .buttonStyle(.borderedProminent)
-            .disabled(fireTVIP.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.top, 8)
     }
 
-    private var installStatusSection: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Text("Install Status")
-                .font(.headline)
-            Text(adbManager.installStatus)
-                .font(.subheadline)
-                .foregroundColor(.secondary)
+    private var installStatusCard: some View {
+        BeamioCard {
+            VStack(alignment: .leading, spacing: 10) {
+                HStack {
+                    Text("Install Activity")
+                        .font(BeamioTheme.subtitleFont(16))
+                    Spacer()
+                    Text(adbManager.installStatus)
+                        .font(BeamioTheme.bodyFont(12))
+                        .foregroundColor(.secondary)
+                }
 
-            if let progress = adbManager.installProgress {
-                ProgressView(value: progress)
-                    .progressViewStyle(.linear)
-            } else if adbManager.isInstalling {
-                ProgressView()
-                    .progressViewStyle(.linear)
-            }
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-    }
-
-    private var actionsSection: some View {
-        HStack {
-            TextField("Search apps", text: $searchText)
-                .textFieldStyle(.roundedBorder)
-
-            Button {
-                adbManager.refreshApps()
-            } label: {
-                Label("Refresh", systemImage: "arrow.clockwise")
-            }
-            .buttonStyle(.bordered)
-            .disabled(adbManager.isLoadingApps)
-        }
-    }
-
-    private var appsSection: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack {
-                Text("Installed Apps")
-                    .font(.headline)
-                Spacer()
-                if adbManager.isLoadingApps {
+                if let progress = adbManager.installProgress {
+                    ProgressView(value: progress)
+                        .tint(BeamioTheme.accent)
+                } else if adbManager.isInstalling {
                     ProgressView()
+                        .tint(BeamioTheme.accent)
+                } else {
+                    Text("No active installs")
+                        .font(BeamioTheme.bodyFont(12))
+                        .foregroundColor(.secondary)
                 }
             }
+        }
+    }
 
-            if let appsError = adbManager.appsError {
-                Text(appsError)
-                    .font(.caption)
-                    .foregroundColor(.red)
-            }
+    private var appsListCard: some View {
+        BeamioCard {
+            VStack(alignment: .leading, spacing: 12) {
+                HStack {
+                    Text("Installed Apps")
+                        .font(BeamioTheme.subtitleFont(16))
+                    Spacer()
+                    if adbManager.isLoadingApps {
+                        ProgressView()
+                    }
+                }
 
-            if filteredApps.isEmpty {
-                Text(adbManager.isLoadingApps ? "Loading apps..." : "No apps found.")
-                    .foregroundColor(.secondary)
-            } else {
-                List(filteredApps) { app in
-                    AppRow(app: app) {
-                        let source = adbManager.updateSource(for: app.packageName)
-                        if let source {
-                            adbManager.installApk(from: source)
-                        } else {
-                            selectedApp = app
+                if let appsError = adbManager.appsError {
+                    Text(appsError)
+                        .font(BeamioTheme.bodyFont(12))
+                        .foregroundColor(.red)
+                }
+
+                if filteredApps.isEmpty {
+                    Text(adbManager.isLoadingApps ? "Loading apps..." : "No apps found.")
+                        .font(BeamioTheme.bodyFont(12))
+                        .foregroundColor(.secondary)
+                } else {
+                    LazyVStack(spacing: 12) {
+                        ForEach(filteredApps) { app in
+                            AppRow(app: app) {
+                                let source = adbManager.updateSource(for: app.packageName)
+                                if let source {
+                                    adbManager.installApk(from: source)
+                                } else {
+                                    selectedApp = app
+                                }
+                            }
+                            .onAppear {
+                                adbManager.loadIcon(for: app)
+                            }
                         }
                     }
-                    .onAppear {
-                        adbManager.loadIcon(for: app)
-                    }
                 }
-                .frame(maxHeight: 420)
             }
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
     }
 }
 
@@ -143,61 +153,68 @@ private struct AppRow: View {
     let app: AppInfo
     let updateAction: () -> Void
 
-    private var isSideloaded: Bool {
-        guard let installer = app.installer?.lowercased() else { return true }
-        if installer.isEmpty || installer == "null" { return true }
-        let knownInstallers = [
-            "com.android.vending",
-            "com.amazon.venezia",
-            "com.amazon.appstore",
-            "com.amazon.windowshop"
+    private var sourceBadge: (String, Color)? {
+        if app.isSystem {
+            return ("System", .gray)
+        }
+        guard let installer = app.installer?.lowercased(), !installer.isEmpty, installer != "null" else {
+            return ("Unknown Source", BeamioTheme.warning)
+        }
+        let knownInstallers: [String: String] = [
+            "com.android.vending": "Google Play",
+            "com.amazon.venezia": "Amazon Appstore",
+            "com.amazon.appstore": "Amazon Appstore",
+            "com.amazon.windowshop": "Amazon Appstore"
         ]
-        return !knownInstallers.contains(installer)
+        if let name = knownInstallers[installer] {
+            return (name, BeamioTheme.success)
+        }
+        return ("Sideloaded", BeamioTheme.warning)
     }
 
     private var updateLabel: String {
         if adbManager.updateSource(for: app.packageName) != nil {
             return "Update"
         }
-        return isSideloaded ? "Add Source" : "Set Source"
+        return "Set Source"
     }
 
     var body: some View {
         HStack(spacing: 12) {
             iconView
-                .frame(width: 40, height: 40)
-                .clipShape(RoundedRectangle(cornerRadius: 8))
+                .frame(width: 46, height: 46)
+                .clipShape(RoundedRectangle(cornerRadius: 12))
 
             VStack(alignment: .leading, spacing: 4) {
                 Text(app.label)
-                    .fontWeight(.semibold)
+                    .font(BeamioTheme.subtitleFont(15))
                 Text(app.packageName)
-                    .font(.caption)
+                    .font(BeamioTheme.bodyFont(11))
                     .foregroundColor(.secondary)
                     .lineLimit(1)
                 if let version = app.versionName, !version.isEmpty {
                     Text("Version \(version)")
-                        .font(.caption2)
+                        .font(BeamioTheme.bodyFont(11))
                         .foregroundColor(.secondary)
                 }
             }
 
             Spacer()
 
-            if isSideloaded {
-                Text("Sideloaded")
-                    .font(.caption2)
-                    .padding(.horizontal, 6)
-                    .padding(.vertical, 2)
-                    .background(Color.orange.opacity(0.2))
-                    .clipShape(Capsule())
+            if let badge = sourceBadge {
+                PillBadge(text: badge.0, color: badge.1)
             }
 
             Button(updateLabel) {
                 updateAction()
             }
-            .buttonStyle(.bordered)
+            .buttonStyle(SecondaryButtonStyle())
         }
+        .padding(12)
+        .background(
+            RoundedRectangle(cornerRadius: 14)
+                .fill(Color(.secondarySystemBackground).opacity(0.7))
+        )
     }
 
     @ViewBuilder
@@ -208,10 +225,10 @@ private struct AppRow: View {
                 .scaledToFit()
         } else {
             ZStack {
-                RoundedRectangle(cornerRadius: 8)
-                    .fill(Color.gray.opacity(0.2))
+                RoundedRectangle(cornerRadius: 12)
+                    .fill(BeamioTheme.accentSoft)
                 Text(String(app.label.prefix(1)))
-                    .font(.headline)
+                    .font(BeamioTheme.subtitleFont(16))
                     .foregroundColor(.secondary)
             }
         }
@@ -233,59 +250,84 @@ private struct UpdateSourceSheet: View {
     }
 
     var body: some View {
-        NavigationView {
-            Form {
-                Section("App") {
-                    Text(app.label)
-                        .font(.headline)
-                    Text(app.packageName)
-                        .font(.caption)
-                        .foregroundColor(.secondary)
-                }
+        NavigationStack {
+            ZStack {
+                AppBackground()
 
-                Section("Update Source") {
-                    TextField("https://example.com/app.apk", text: $urlText)
-                        .keyboardType(.URL)
-                        .textInputAutocapitalization(.never)
-                        .autocorrectionDisabled()
-
-                    if let errorMessage {
-                        Text(errorMessage)
-                            .font(.caption)
-                            .foregroundColor(.red)
-                    }
-
-                    Button("Save Source") {
-                        adbManager.setUpdateSource(urlText, for: app.packageName)
-                        dismiss()
-                    }
-
-                    Button("Save & Install") {
-                        adbManager.setUpdateSource(urlText, for: app.packageName)
-                        let trimmed = urlText.trimmingCharacters(in: .whitespacesAndNewlines)
-                        if !trimmed.isEmpty {
-                            adbManager.installApk(from: trimmed)
-                            dismiss()
-                        } else {
-                            errorMessage = "Please enter a valid URL."
+                ScrollView {
+                    VStack(spacing: 16) {
+                        BeamioCard {
+                            VStack(alignment: .leading, spacing: 6) {
+                                Text(app.label)
+                                    .font(BeamioTheme.subtitleFont(16))
+                                Text(app.packageName)
+                                    .font(BeamioTheme.bodyFont(12))
+                                    .foregroundColor(.secondary)
+                            }
                         }
-                    }
-                }
 
-                Section("Install from File") {
-                    Button("Choose APK File") {
-                        showFileImporter = true
-                    }
-                }
+                        BeamioCard {
+                            VStack(alignment: .leading, spacing: 12) {
+                                Text("Update Source")
+                                    .font(BeamioTheme.subtitleFont(16))
 
-                Section {
-                    Button("Clear Source", role: .destructive) {
-                        adbManager.setUpdateSource(nil, for: app.packageName)
-                        dismiss()
+                                TextField("https://example.com/app.apk", text: $urlText)
+                                    .keyboardType(.URL)
+                                    .textInputAutocapitalization(.never)
+                                    .autocorrectionDisabled()
+                                    .beamioTextField()
+
+                                if let errorMessage {
+                                    Text(errorMessage)
+                                        .font(BeamioTheme.bodyFont(12))
+                                        .foregroundColor(.red)
+                                }
+
+                                HStack(spacing: 12) {
+                                    Button("Save") {
+                                        adbManager.setUpdateSource(urlText, for: app.packageName)
+                                        dismiss()
+                                    }
+                                    .buttonStyle(SecondaryButtonStyle())
+
+                                    Button("Save & Install") {
+                                        adbManager.setUpdateSource(urlText, for: app.packageName)
+                                        let trimmed = urlText.trimmingCharacters(in: .whitespacesAndNewlines)
+                                        if !trimmed.isEmpty {
+                                            adbManager.installApk(from: trimmed)
+                                            dismiss()
+                                        } else {
+                                            errorMessage = "Please enter a valid URL."
+                                        }
+                                    }
+                                    .buttonStyle(PrimaryButtonStyle())
+                                }
+                            }
+                        }
+
+                        BeamioCard {
+                            VStack(alignment: .leading, spacing: 12) {
+                                Text("Install from File")
+                                    .font(BeamioTheme.subtitleFont(16))
+
+                                Button("Choose APK File") {
+                                    showFileImporter = true
+                                }
+                                .buttonStyle(SecondaryButtonStyle())
+                            }
+                        }
+
+                        Button("Clear Source", role: .destructive) {
+                            adbManager.setUpdateSource(nil, for: app.packageName)
+                            dismiss()
+                        }
+                        .buttonStyle(SecondaryButtonStyle())
+                        .padding(.top, 4)
                     }
+                    .padding(20)
                 }
             }
-            .navigationTitle("Update \(app.label)")
+            .navigationTitle("Update Source")
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
                     Button("Close") {
@@ -319,6 +361,6 @@ private struct UpdateSourceSheet: View {
 }
 
 #Preview {
-    ContentView()
+    DashboardView()
         .environmentObject(ADBManager.shared)
 }

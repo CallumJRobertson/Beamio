@@ -4,16 +4,21 @@ struct LogView: View {
     @EnvironmentObject private var adbManager: ADBManager
 
     var body: some View {
-        NavigationView {
-            ScrollView {
-                VStack(alignment: .leading, spacing: 8) {
-                    ForEach(adbManager.logLines, id: \.self) { line in
-                        Text(line)
-                            .font(.caption)
-                            .frame(maxWidth: .infinity, alignment: .leading)
+        NavigationStack {
+            ZStack {
+                AppBackground()
+
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 8) {
+                        ForEach(adbManager.logLines, id: \.self) { line in
+                            Text(line)
+                                .font(BeamioTheme.monoFont(11))
+                                .foregroundColor(.primary)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                        }
                     }
+                    .padding(20)
                 }
-                .padding()
             }
             .navigationTitle("Logs")
         }
