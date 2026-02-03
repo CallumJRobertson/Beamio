@@ -12,6 +12,17 @@ struct ApkItem: Identifiable, Hashable {
     }
 }
 
+struct AppInfo: Identifiable, Hashable {
+    var id: String { packageName }
+    let packageName: String
+    var label: String
+    var versionName: String?
+    var installer: String?
+    var apkPath: String?
+    var isSystem: Bool
+    var iconData: Data?
+}
+
 enum ADBError: Error, LocalizedError {
     case invalidHost
     case connectionClosed
@@ -55,12 +66,21 @@ final class ADBManager: ObservableObject {
     @Published var installStatus: String = "Idle"
     @Published var installProgress: Double? = nil
     @Published var isInstalling: Bool = false
+    @Published var apps: [AppInfo] = []
+    @Published var isLoadingApps: Bool = false
+    @Published var appsError: String? = nil
 
     private let maxLogLines = 800
     private let workerQueue = DispatchQueue(label: "com.beamio.adb.worker", qos: .userInitiated)
+    private let iconQueue = DispatchQueue(label: "com.beamio.adb.icon", qos: .utility)
     private var client: ADBClient?
+    private var iconLoadsInProgress = Set<String>()
+    private var updateSources: [String: String] = [:]
+    private let updateSourcesKey = "appUpdateSources"
 
-    private init() {}
+    private init() {
+        loadUpdateSources()
+    }
 
     func connect(ipAddress: String, keyStoragePath: String, completion: ((String) -> Void)? = nil) {
         let targetIP = ipAddress.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -243,6 +263,115 @@ final class ADBManager: ObservableObject {
         }
     }
 
+    func refreshApps(includeSystem: Bool = false) {
+        guard let client else {
+            log("No device connected.")
+            return
+        }
+
+        isLoadingApps = true
+        appsError = nil
+        log("Fetching installed apps...")
+
+        workerQueue.async { [weak self] in
+            guard let self else { return }
+            Task {
+                do {
+                    let fetched = try await client.fetchInstalledApps(includeSystem: includeSystem)
+                    DispatchQueue.main.async {
+                        self.apps = fetched
+                        self.isLoadingApps = false
+                        self.appsError = nil
+                        self.log("Loaded \(fetched.count) apps.")
+                    }
+                } catch {
+                    DispatchQueue.main.async {
+                        self.isLoadingApps = false
+                        self.appsError = error.localizedDescription
+                        self.log("App list failed: \(error.localizedDescription)")
+                        self.log("Error: \(String(reflecting: error))")
+                    }
+                }
+            }
+        }
+    }
+
+    func updateSource(for package: String) -> String? {
+        updateSources[package]
+    }
+
+    func setUpdateSource(_ source: String?, for package: String) {
+        if let source, !source.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            updateSources[package] = source.trimmingCharacters(in: .whitespacesAndNewlines)
+        } else {
+            updateSources.removeValue(forKey: package)
+        }
+        saveUpdateSources()
+    }
+
+    func loadIcon(for app: AppInfo) {
+        guard app.iconData == nil else { return }
+        guard let apkPath = app.apkPath else { return }
+        guard let client else { return }
+        guard beginIconLoad(for: app.packageName) else { return }
+        let packageName = app.packageName
+
+        iconQueue.async { [weak self] in
+            guard let self else { return }
+
+            let cacheURL = self.iconCacheURL(for: packageName)
+            if FileManager.default.fileExists(atPath: cacheURL.path),
+               let data = try? Data(contentsOf: cacheURL) {
+                DispatchQueue.main.async {
+                    self.updateAppIcon(package: packageName, data: data)
+                }
+                self.endIconLoad(for: packageName)
+                return
+            }
+
+            Task {
+                do {
+                    let tempApkURL = FileManager.default.temporaryDirectory.appendingPathComponent("\(packageName).apk")
+                    if FileManager.default.fileExists(atPath: tempApkURL.path) {
+                        try? FileManager.default.removeItem(at: tempApkURL)
+                    }
+                    try await client.pullFile(remotePath: apkPath, localURL: tempApkURL)
+                    if let iconData = APKIconExtractor.extractIcon(from: tempApkURL) {
+                        try? FileManager.default.createDirectory(at: cacheURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+                        try? iconData.write(to: cacheURL)
+                        DispatchQueue.main.async {
+                            self.updateAppIcon(package: packageName, data: iconData)
+                        }
+                    }
+                } catch {
+                    DispatchQueue.main.async {
+                        self.log("Icon fetch failed for \(packageName): \(error.localizedDescription)")
+                    }
+                }
+
+                self.endIconLoad(for: packageName)
+            }
+        }
+    }
+
+    func sendKeyEvent(_ keyCode: Int) {
+        guard let client else {
+            log("No device connected.")
+            return
+        }
+        workerQueue.async {
+            Task {
+                do {
+                    try await client.sendKeyEvent(keyCode)
+                } catch {
+                    DispatchQueue.main.async {
+                        self.log("Remote command failed: \(error.localizedDescription)")
+                    }
+                }
+            }
+        }
+    }
+
     private static func parseApkLinks(from html: String, baseURL: URL) -> [ApkItem] {
         let pattern = "<a\\s+[^>]*href=[\"']([^\"']+\\.apk)[\"'][^>]*>(.*?)</a>"
         let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive])
@@ -351,6 +480,54 @@ final class ADBManager: ObservableObject {
             }
         }
     }
+
+    private func updateAppIcon(package: String, data: Data) {
+        if let index = apps.firstIndex(where: { $0.packageName == package }) {
+            apps[index].iconData = data
+        }
+    }
+
+    private func beginIconLoad(for package: String) -> Bool {
+        var shouldStart = false
+        iconQueue.sync {
+            if !iconLoadsInProgress.contains(package) {
+                iconLoadsInProgress.insert(package)
+                shouldStart = true
+            }
+        }
+        return shouldStart
+    }
+
+    private func endIconLoad(for package: String) {
+        iconQueue.async { [weak self] in
+            self?.iconLoadsInProgress.remove(package)
+        }
+    }
+
+    private func iconCacheURL(for package: String) -> URL {
+        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+            ?? FileManager.default.temporaryDirectory
+        let dir = base.appendingPathComponent("IconCache", isDirectory: true)
+        return dir.appendingPathComponent("\(package).png")
+    }
+
+    private func loadUpdateSources() {
+        guard let data = UserDefaults.standard.data(forKey: updateSourcesKey) else {
+            updateSources = [:]
+            return
+        }
+        if let decoded = try? JSONDecoder().decode([String: String].self, from: data) {
+            updateSources = decoded
+        } else {
+            updateSources = [:]
+        }
+    }
+
+    private func saveUpdateSources() {
+        if let data = try? JSONEncoder().encode(updateSources) {
+            UserDefaults.standard.set(data, forKey: updateSourcesKey)
+        }
+    }
 }
 
 private final class ADBClient {
@@ -408,6 +585,65 @@ private final class ADBClient {
         }
     }
 
+    func fetchInstalledApps(includeSystem: Bool) async throws -> [AppInfo] {
+        let packagePathsOutput = try await runShell("pm list packages -f")
+        let installerOutput = try await runShell("cmd package list packages -i")
+        let userOutput = try await runShell("pm list packages -3")
+
+        var packagePaths: [String: String] = [:]
+        for line in packagePathsOutput.split(separator: "\n") {
+            let trimmed = String(line).trimmingCharacters(in: .whitespacesAndNewlines)
+            guard trimmed.hasPrefix("package:") else { continue }
+            let remainder = trimmed.dropFirst("package:".count)
+            let parts = remainder.split(separator: "=", maxSplits: 1).map(String.init)
+            guard parts.count == 2 else { continue }
+            packagePaths[parts[1]] = parts[0]
+        }
+
+        var installers: [String: String] = [:]
+        for line in installerOutput.split(separator: "\n") {
+            let trimmed = String(line).trimmingCharacters(in: .whitespacesAndNewlines)
+            guard trimmed.hasPrefix("package:") else { continue }
+            let remainder = trimmed.dropFirst("package:".count)
+            let parts = remainder.split(separator: "installer=", maxSplits: 1).map(String.init)
+            if parts.count == 2 {
+                installers[parts[0].trimmingCharacters(in: .whitespaces)] = parts[1].trimmingCharacters(in: .whitespaces)
+            }
+        }
+
+        var userPackages = Set<String>()
+        for line in userOutput.split(separator: "\n") {
+            let trimmed = String(line).trimmingCharacters(in: .whitespacesAndNewlines)
+            guard trimmed.hasPrefix("package:") else { continue }
+            userPackages.insert(trimmed.dropFirst("package:".count).trimmingCharacters(in: .whitespaces))
+        }
+
+        let targetPackages = includeSystem ? Array(packagePaths.keys) : Array(userPackages)
+        var apps: [AppInfo] = []
+
+        for package in targetPackages.sorted() {
+            let apkPath = packagePaths[package]
+            let installer = installers[package]
+            let isSystem = !userPackages.contains(package)
+            let details = try? await fetchPackageDetails(package)
+            let label = details?.label?.isEmpty == false ? details!.label! : package
+            let versionName = details?.versionName
+            apps.append(
+                AppInfo(
+                    packageName: package,
+                    label: label,
+                    versionName: versionName,
+                    installer: installer,
+                    apkPath: apkPath,
+                    isSystem: isSystem,
+                    iconData: nil
+                )
+            )
+        }
+
+        return apps
+    }
+
     func installApk(at localURL: URL, progress: @escaping (String, Double?) -> Void) async throws {
         progress("Uploading APK...", 0)
         try await pushFile(localURL: localURL, remotePath: "/data/local/tmp/beamio_payload.apk", mode: 0o644) { sent, total in
@@ -433,6 +669,31 @@ private final class ADBClient {
         let stream = try await openStream(service: "shell:\(command)")
         let data = try await readStreamUntilClose(stream)
         return String(data: data, encoding: .utf8) ?? ""
+    }
+
+    func sendKeyEvent(_ keyCode: Int) async throws {
+        _ = try await runShell("input keyevent \(keyCode)")
+    }
+
+    private func fetchPackageDetails(_ package: String) async throws -> (label: String?, versionName: String?) {
+        let output = try await runShell("dumpsys package \(package)")
+        var label: String?
+        var versionName: String?
+
+        for rawLine in output.split(separator: "\n") {
+            let line = String(rawLine).trimmingCharacters(in: .whitespacesAndNewlines)
+            if versionName == nil, let range = line.range(of: "versionName=") {
+                versionName = String(line[range.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+            if label == nil, line.hasPrefix("application-label:") {
+                label = line.replacingOccurrences(of: "application-label:", with: "").trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+            if versionName != nil, label != nil {
+                break
+            }
+        }
+
+        return (label, versionName)
     }
 
     private func pushFile(localURL: URL, remotePath: String, mode: Int, progress: ((Int64, Int64?) -> Void)? = nil) async throws {
@@ -545,6 +806,86 @@ private final class ADBClient {
         }
 
         throw ADBError.invalidResponse
+    }
+
+    func pullFile(remotePath: String, localURL: URL) async throws {
+        let stream = try await openStream(service: "sync:")
+        var buffer = Data()
+        var bufferOffset = 0
+
+        func availableBytes() -> Int {
+            buffer.count - bufferOffset
+        }
+
+        func compactBufferIfNeeded() {
+            guard bufferOffset > 0 else { return }
+            if bufferOffset > 64 * 1024, bufferOffset > buffer.count / 2 {
+                buffer = Data(buffer[bufferOffset...])
+                bufferOffset = 0
+            }
+        }
+
+        func fillBuffer(minBytes: Int) async throws {
+            while availableBytes() < minBytes {
+                let packet = try await readPacket()
+                switch packet.command {
+                case .wrte:
+                    guard packet.arg0 == stream.remoteId, packet.arg1 == stream.localId else { continue }
+                    buffer.append(packet.data)
+                    try await sendPacket(.okay, arg0: stream.localId, arg1: stream.remoteId, data: Data())
+                case .clse:
+                    try await sendPacket(.clse, arg0: stream.localId, arg1: stream.remoteId, data: Data())
+                    throw ADBError.streamClosed
+                default:
+                    continue
+                }
+            }
+        }
+
+        func readBytes(_ length: Int) async throws -> Data {
+            try await fillBuffer(minBytes: length)
+            let available = availableBytes()
+            guard length <= available else {
+                throw ADBError.protocolError("Buffer underflow (needed \(length), have \(available))")
+            }
+            let start = bufferOffset
+            let end = bufferOffset + length
+            let slice = buffer[start..<end]
+            bufferOffset = end
+            compactBufferIfNeeded()
+            return Data(slice)
+        }
+
+        try await writeSyncCommand(stream: stream, id: "RECV", data: Data(remotePath.utf8), buffer: &buffer)
+
+        FileManager.default.createFile(atPath: localURL.path, contents: nil)
+        let handle = try FileHandle(forWritingTo: localURL)
+        defer { try? handle.close() }
+
+        while true {
+            let responseId = try await readBytes(4)
+            let responseIdString = String(data: responseId, encoding: .ascii) ?? ""
+            let lengthData = try await readBytes(4)
+            let length = lengthData.readUInt32LE(at: 0)
+
+            if responseIdString == "DATA" {
+                let chunk = try await readBytes(Int(length))
+                handle.write(chunk)
+                continue
+            }
+
+            if responseIdString == "DONE" {
+                return
+            }
+
+            if responseIdString == "FAIL" {
+                let messageData = try await readBytes(Int(length))
+                let message = String(data: messageData, encoding: .utf8) ?? "Unknown error"
+                throw ADBError.syncFailed(message)
+            }
+
+            throw ADBError.invalidResponse
+        }
     }
 
     private func openStream(service: String) async throws -> ADBStream {
@@ -1059,7 +1400,7 @@ private enum ADBKeyManager {
     }
 }
 
-private extension Data {
+extension Data {
     func readUInt32LE(at offset: Int) -> UInt32 {
         guard offset + 3 < count else { return 0 }
         let b0 = UInt32(self[offset])

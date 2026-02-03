@@ -5,20 +5,21 @@ struct SettingsView: View {
     @AppStorage("updateURL") private var updateURL: String = ""
 
     private var isValidIP: Bool {
-        let pattern = "^(25[0-5]|2[0-4]\\d|1\\d{2}|[1-9]?\\d)(\\.(25[0-5]|2[0-4]\\d|1\\d{2}|[1-9]?\\d)){3}$"
+        let ip = "(25[0-5]|2[0-4]\\\\d|1\\\\d{2}|[1-9]?\\\\d)"
+        let pattern = "^\(ip)(\\\\.\(ip)){3}(:[0-9]{1,5})?$"
         return NSPredicate(format: "SELF MATCHES %@", pattern).evaluate(with: fireTVIP)
     }
 
     var body: some View {
         Form {
-            Section("Fire TV IP Address") {
-                TextField("192.168.0.10", text: $fireTVIP)
+            Section("Device IP Address") {
+                TextField("192.168.0.10:5555", text: $fireTVIP)
                     .keyboardType(.decimalPad)
 
                 HStack {
                     Image(systemName: isValidIP ? "checkmark.circle" : "exclamationmark.triangle")
                         .foregroundColor(isValidIP ? .green : .orange)
-                    Text(isValidIP ? "Valid IP address" : "Enter a valid IPv4 address")
+                    Text(isValidIP ? "Valid IP address" : "Enter a valid IPv4 address (optionally with :port)")
                         .font(.caption)
                         .foregroundColor(.secondary)
                 }
