@@ -53,6 +53,7 @@ final class ADBManager: ObservableObject {
     @Published var connectionStatus: String = "Disconnected"
     @Published var logLines: [String] = []
 
+    private let maxLogLines = 800
     private let workerQueue = DispatchQueue(label: "com.beamio.adb.worker", qos: .userInitiated)
     private var client: ADBClient?
 
@@ -245,11 +246,18 @@ final class ADBManager: ObservableObject {
     private func log(_ message: String) {
         let entry = "[\(timestamp())] \(message)"
         if Thread.isMainThread {
-            logLines.append(entry)
+            appendLog(entry)
         } else {
             DispatchQueue.main.async { [weak self] in
-                self?.logLines.append(entry)
+                self?.appendLog(entry)
             }
+        }
+    }
+
+    private func appendLog(_ entry: String) {
+        logLines.append(entry)
+        if logLines.count > maxLogLines {
+            logLines.removeFirst(logLines.count - maxLogLines)
         }
     }
 
@@ -266,6 +274,7 @@ private final class ADBClient {
     private var nextLocalId: UInt32 = 1
     private var keyPair: ADBKeyPair?
     private var maxData: Int = 4096
+    private var dataPacketCount: Int = 0
 
     init(logger: ((String) -> Void)? = nil) {
         self.logger = logger
@@ -336,6 +345,16 @@ private final class ADBClient {
         var buffer = Data()
         var bufferOffset = 0
 
+        let fileSize = (try? FileManager.default.attributesOfItem(atPath: localURL.path)[.size] as? NSNumber)?.int64Value
+        var sentBytes: Int64 = 0
+        let progressStep: Int64
+        if let fileSize, fileSize > 0 {
+            progressStep = max(512 * 1024, fileSize / 20)
+        } else {
+            progressStep = 512 * 1024
+        }
+        var nextProgress = progressStep
+
         func availableBytes() -> Int {
             buffer.count - bufferOffset
         }
@@ -395,6 +414,16 @@ private final class ADBClient {
             let chunk = try handle.read(upToCount: maxChunk) ?? Data()
             if chunk.isEmpty { break }
             try await writeSyncCommand(stream: stream, id: "DATA", data: chunk, buffer: &buffer)
+            sentBytes += Int64(chunk.count)
+            if sentBytes >= nextProgress {
+                if let fileSize, fileSize > 0 {
+                    let percent = Int((Double(sentBytes) / Double(fileSize)) * 100)
+                    trace("Upload progress: \(percent)% (\(sentBytes)/\(fileSize) bytes)")
+                } else {
+                    trace("Upload progress: \(sentBytes) bytes")
+                }
+                nextProgress = sentBytes + progressStep
+            }
         }
 
         let mtime = UInt32(Date().timeIntervalSince1970)
@@ -557,8 +586,27 @@ private final class ADBClient {
     }
 
     private func tracePacket(direction: String, command: ADBCommand, arg0: UInt32, arg1: UInt32, length: UInt32, checksum: UInt32, data: Data) {
-        let payloadPreview = data.hexPreview(maxBytes: 256)
+        if command == .wrte, let syncId = syncCommandId(from: data) {
+            if syncId == "DATA" {
+                dataPacketCount += 1
+                if dataPacketCount <= 3 || dataPacketCount % 100 == 0 {
+                    trace("\(direction) \(command.name) id=DATA chunk=\(dataPacketCount) bytes=\(data.count)")
+                }
+                return
+            }
+            let payloadPreview = data.hexPreview(maxBytes: 64)
+            trace("\(direction) \(command.name) id=\(syncId) arg0=\(arg0) arg1=\(arg1) len=\(length) checksum=\(checksum) data=\(payloadPreview)")
+            return
+        }
+
+        let payloadPreview = data.hexPreview(maxBytes: 64)
         trace("\(direction) \(command.name) arg0=\(arg0) arg1=\(arg1) len=\(length) checksum=\(checksum) data=\(payloadPreview)")
+    }
+
+    private func syncCommandId(from data: Data) -> String? {
+        guard data.count >= 4 else { return nil }
+        let idData = data.prefix(4)
+        return String(data: idData, encoding: .ascii)
     }
 }
 
