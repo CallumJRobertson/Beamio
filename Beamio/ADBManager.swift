@@ -663,6 +663,12 @@ private final class ADBClient {
             userPackages.insert(trimmed.dropFirst("package:".count).trimmingCharacters(in: .whitespaces))
         }
 
+        let systemLines = await systemPackageLines()
+        var systemPackages = Set<String>()
+        for line in systemLines {
+            systemPackages.insert(line)
+        }
+
         let targetPackages: [String]
         if includeSystem {
             targetPackages = Array(packagePaths.keys)
@@ -689,6 +695,8 @@ private final class ADBClient {
                 isSystem = detailsSystem
             } else if let path = details?.codePath {
                 isSystem = isSystemPath(path)
+            } else if systemPackages.contains(package) {
+                isSystem = true
             } else if !userPackages.isEmpty {
                 isSystem = !userPackages.contains(package)
             } else if let path = apkPath {
@@ -757,6 +765,19 @@ private final class ADBClient {
         } catch {
             trace("Shell command failed (\(command)): \(error.localizedDescription)")
             return ""
+        }
+    }
+
+    private func systemPackageLines() async -> [String] {
+        var output = await runShellOptional("cmd package list packages -s")
+        if output.isEmpty {
+            output = await runShellOptional("pm list packages -s")
+        }
+        return output.split(separator: "\n").compactMap { line in
+            let trimmed = String(line).trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { return nil }
+            guard trimmed.hasPrefix("package:") else { return trimmed }
+            return String(trimmed.dropFirst("package:".count)).trimmingCharacters(in: .whitespaces)
         }
     }
 
