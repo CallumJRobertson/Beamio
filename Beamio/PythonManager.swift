@@ -27,6 +27,14 @@ final class PythonManager: ObservableObject {
         guard !isInitialized else { return }
         isInitialized = true
 
+        if let pythonLibraryPath = pythonLibraryPath() {
+            PythonLibrary.useLibrary(at: pythonLibraryPath)
+        } else {
+            connectionStatus = "Python unavailable"
+            log("Python.framework not found in app bundle. Skipping initialization.")
+            return
+        }
+
         let sys = Python.import("sys")
         if let resourcePath = Bundle.main.resourcePath {
             sys.path.append(resourcePath)
@@ -35,6 +43,23 @@ final class PythonManager: ObservableObject {
 
         worker = Python.import("BeamioWorker")
         log("Python environment initialized.")
+    }
+
+    private func pythonLibraryPath() -> String? {
+        let candidates = [
+            Bundle.main.privateFrameworksPath,
+            Bundle.main.frameworksPath
+        ]
+        .compactMap { $0 }
+        .map { "\($0)/Python.framework/Python" }
+
+        for path in candidates {
+            if FileManager.default.fileExists(atPath: path) {
+                return path
+            }
+        }
+
+        return nil
     }
 
     func connect(ipAddress: String, keyStoragePath: String, completion: ((String) -> Void)? = nil) {
