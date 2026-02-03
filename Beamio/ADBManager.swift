@@ -866,14 +866,19 @@ private enum ADBKeyManager {
         }
 
         func mpint(_ data: Data) -> Data {
-            var bytes = Data(data)
-            while bytes.first == 0x00 && bytes.count > 1 {
-                bytes.removeFirst()
+            guard !data.isEmpty else { return Data() }
+            var start = data.startIndex
+            let end = data.endIndex
+            while start < data.index(before: end), data[start] == 0x00 {
+                start = data.index(after: start)
             }
-            if let first = bytes.first, first & 0x80 != 0 {
-                bytes.insert(0x00, at: 0)
+            let trimmed = data[start..<end]
+            var result = Data()
+            if let first = trimmed.first, first & 0x80 != 0 {
+                result.append(0x00)
             }
-            return bytes
+            result.append(trimmed)
+            return result
         }
 
         var key = Data()
