@@ -52,8 +52,7 @@ final class PythonManager: ObservableObject {
         do {
             let sys = try Python.attemptImport("sys")
             if let resourcePath = Bundle.main.resourcePath {
-                let stdlibPath = "\(resourcePath)/python3.13"
-                let stdlibZipPath = "\(resourcePath)/python3.13.zip"
+                let stdlibPath = "\(resourcePath)/python3.13.bundle"
                 let stdlibSitePackagesPath = "\(stdlibPath)/site-packages"
 
                 sys.path.append(resourcePath)
@@ -64,12 +63,9 @@ final class PythonManager: ObservableObject {
                 if FileManager.default.fileExists(atPath: stdlibSitePackagesPath) {
                     sys.path.append(stdlibSitePackagesPath)
                 }
-                if FileManager.default.fileExists(atPath: stdlibZipPath) {
-                    sys.path.append(stdlibZipPath)
-                }
                 if !FileManager.default.fileExists(atPath: stdlibPath)
-                    && !FileManager.default.fileExists(atPath: stdlibZipPath) {
-                    log("Python stdlib not found. Bundle python3.13 or python3.13.zip in app resources.")
+                {
+                    log("Python stdlib not found. Bundle python3.13.bundle in app resources.")
                 }
             }
 
@@ -82,17 +78,13 @@ final class PythonManager: ObservableObject {
     }
 
     private func configurePythonEnvironment(resourcePath: String) {
-        let stdlibPath = "\(resourcePath)/python3.13"
-        let stdlibZipPath = "\(resourcePath)/python3.13.zip"
+        let stdlibPath = "\(resourcePath)/python3.13.bundle"
         let bundledSitePackages = "\(resourcePath)/site-packages"
         let stdlibSitePackages = "\(stdlibPath)/site-packages"
 
         var pythonPathEntries: [String] = []
         if FileManager.default.fileExists(atPath: stdlibPath) {
             pythonPathEntries.append(stdlibPath)
-        }
-        if FileManager.default.fileExists(atPath: stdlibZipPath) {
-            pythonPathEntries.append(stdlibZipPath)
         }
         if FileManager.default.fileExists(atPath: bundledSitePackages) {
             pythonPathEntries.append(bundledSitePackages)
