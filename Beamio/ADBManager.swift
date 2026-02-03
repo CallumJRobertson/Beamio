@@ -435,7 +435,7 @@ private final class ADBClient {
         return String(data: data, encoding: .utf8) ?? ""
     }
 
-    private func pushFile(localURL: URL, remotePath: String, mode: Int, progress: (@escaping (Int64, Int64?) -> Void)? = nil) async throws {
+    private func pushFile(localURL: URL, remotePath: String, mode: Int, progress: ((Int64, Int64?) -> Void)? = nil) async throws {
         let stream = try await openStream(service: "sync:")
         var buffer = Data()
         var bufferOffset = 0
