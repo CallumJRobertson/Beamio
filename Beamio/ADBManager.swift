@@ -22,6 +22,52 @@ struct AppInfo: Identifiable, Hashable {
     var apkPath: String?
     var isSystem: Bool
     var iconData: Data?
+    var isLoadingIcon: Bool = false
+}
+
+struct DeviceInfo: Equatable {
+    var model: String = ""
+    var manufacturer: String = ""
+    var androidVersion: String = ""
+    var sdkVersion: String = ""
+    var buildId: String = ""
+    var serialNumber: String = ""
+
+    var displayName: String {
+        if !model.isEmpty && !manufacturer.isEmpty {
+            return "\(manufacturer) \(model)"
+        } else if !model.isEmpty {
+            return model
+        }
+        return "Fire TV Device"
+    }
+
+    var isEmpty: Bool {
+        model.isEmpty && manufacturer.isEmpty && androidVersion.isEmpty
+    }
+}
+
+enum ConnectionState: Equatable {
+    case disconnected
+    case connecting
+    case connected
+    case reconnecting
+    case failed(String)
+
+    var displayText: String {
+        switch self {
+        case .disconnected: return "Disconnected"
+        case .connecting: return "Connecting..."
+        case .connected: return "Connected"
+        case .reconnecting: return "Reconnecting..."
+        case .failed(let reason): return "Failed: \(reason)"
+        }
+    }
+
+    var isConnected: Bool {
+        if case .connected = self { return true }
+        return false
+    }
 }
 
 enum ADBError: Error, LocalizedError {
@@ -62,6 +108,7 @@ enum ADBError: Error, LocalizedError {
 final class ADBManager: ObservableObject {
     static let shared = ADBManager()
 
+    @Published var connectionState: ConnectionState = .disconnected
     @Published var connectionStatus: String = "Disconnected"
     @Published var logLines: [String] = []
     @Published var installStatus: String = "Idle"
@@ -71,6 +118,14 @@ final class ADBManager: ObservableObject {
     @Published var isLoadingApps: Bool = false
     @Published var appsError: String? = nil
     @Published var isConnected: Bool = false
+    @Published var deviceInfo: DeviceInfo = DeviceInfo()
+    @Published var iconLoadingCount: Int = 0
+    @Published var totalIconsToLoad: Int = 0
+
+    // Settings
+    @Published var autoReconnect: Bool = true
+    @Published var includeSystemApps: Bool = false
+    @Published var connectionTimeout: TimeInterval = 8.0
 
     private let maxLogLines = 800
     private let workerQueue = DispatchQueue(label: "com.beamio.adb.worker", qos: .userInitiated)
@@ -79,20 +134,43 @@ final class ADBManager: ObservableObject {
     private var iconLoadsInProgress = Set<String>()
     private var updateSources: [String: String] = [:]
     private let updateSourcesKey = "appUpdateSources"
+    private var keepAliveTimer: Timer?
+    private var lastConnectedIP: String = ""
+    private var lastKeyStoragePath: String = ""
+    private var reconnectAttempts: Int = 0
+    private let maxReconnectAttempts: Int = 3
 
     private init() {
         loadUpdateSources()
+        loadSettings()
+    }
+
+    private func loadSettings() {
+        autoReconnect = UserDefaults.standard.object(forKey: "autoReconnect") as? Bool ?? true
+        includeSystemApps = UserDefaults.standard.object(forKey: "includeSystemApps") as? Bool ?? false
+        connectionTimeout = UserDefaults.standard.object(forKey: "connectionTimeout") as? TimeInterval ?? 8.0
+    }
+
+    func saveSettings() {
+        UserDefaults.standard.set(autoReconnect, forKey: "autoReconnect")
+        UserDefaults.standard.set(includeSystemApps, forKey: "includeSystemApps")
+        UserDefaults.standard.set(connectionTimeout, forKey: "connectionTimeout")
     }
 
     func connect(ipAddress: String, keyStoragePath: String, completion: ((String) -> Void)? = nil) {
         let targetIP = ipAddress.trimmingCharacters(in: .whitespacesAndNewlines)
         let (host, port) = Self.parseHostPort(from: targetIP)
-        connectionStatus = "Connecting..."
+
+        lastConnectedIP = targetIP
+        lastKeyStoragePath = keyStoragePath
+        reconnectAttempts = 0
+
+        updateConnectionState(.connecting)
         log("Connecting to \(host):\(port)...")
 
         workerQueue.async { [weak self] in
             guard let self else { return }
-            let client = ADBClient { [weak self] message in
+            let client = ADBClient(timeout: self.connectionTimeout) { [weak self] message in
                 self?.log(message)
             }
             Task {
@@ -101,11 +179,13 @@ final class ADBManager: ObservableObject {
                     try await client.connect(host: host, port: port, keyStoragePath: keyStoragePath)
                     self.client = client
                     result = "Connected"
-                    self.isConnected = true
+                    self.updateConnectionState(.connected)
+                    self.startKeepAlive()
+                    self.fetchDeviceInfo()
                 } catch {
                     self.client = nil
                     result = "Connection failed"
-                    self.isConnected = false
+                    self.updateConnectionState(.failed(error.localizedDescription))
                     self.log("\(result): \(error.localizedDescription)")
                     self.log("Error: \(String(reflecting: error))")
                 }
@@ -114,6 +194,109 @@ final class ADBManager: ObservableObject {
                     self.connectionStatus = result
                     self.log(result)
                     completion?(result)
+                }
+            }
+        }
+    }
+
+    func disconnect() {
+        stopKeepAlive()
+        client = nil
+        updateConnectionState(.disconnected)
+        log("Disconnected")
+        DispatchQueue.main.async {
+            self.deviceInfo = DeviceInfo()
+            self.apps = []
+        }
+    }
+
+    private func updateConnectionState(_ state: ConnectionState) {
+        DispatchQueue.main.async {
+            self.connectionState = state
+            self.connectionStatus = state.displayText
+            self.isConnected = state.isConnected
+        }
+    }
+
+    private func startKeepAlive() {
+        DispatchQueue.main.async { [weak self] in
+            self?.keepAliveTimer?.invalidate()
+            self?.keepAliveTimer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
+                self?.performKeepAlive()
+            }
+        }
+    }
+
+    private func stopKeepAlive() {
+        DispatchQueue.main.async { [weak self] in
+            self?.keepAliveTimer?.invalidate()
+            self?.keepAliveTimer = nil
+        }
+    }
+
+    private func performKeepAlive() {
+        guard let client else {
+            handleConnectionLost()
+            return
+        }
+
+        workerQueue.async { [weak self] in
+            Task {
+                do {
+                    _ = try await client.runShellCommand("echo ping")
+                } catch {
+                    self?.handleConnectionLost()
+                }
+            }
+        }
+    }
+
+    private func handleConnectionLost() {
+        stopKeepAlive()
+
+        guard autoReconnect, !lastConnectedIP.isEmpty, reconnectAttempts < maxReconnectAttempts else {
+            updateConnectionState(.disconnected)
+            log("Connection lost")
+            return
+        }
+
+        reconnectAttempts += 1
+        updateConnectionState(.reconnecting)
+        log("Connection lost, attempting reconnect (\(reconnectAttempts)/\(maxReconnectAttempts))...")
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
+            guard let self else { return }
+            self.connect(ipAddress: self.lastConnectedIP, keyStoragePath: self.lastKeyStoragePath) { result in
+                if result == "Connected" {
+                    self.reconnectAttempts = 0
+                    self.refreshApps(includeSystem: self.includeSystemApps)
+                }
+            }
+        }
+    }
+
+    private func fetchDeviceInfo() {
+        guard let client else { return }
+
+        workerQueue.async { [weak self] in
+            Task {
+                var info = DeviceInfo()
+                do {
+                    info.model = try await client.getProperty("ro.product.model")
+                    info.manufacturer = try await client.getProperty("ro.product.manufacturer")
+                    info.androidVersion = try await client.getProperty("ro.build.version.release")
+                    info.sdkVersion = try await client.getProperty("ro.build.version.sdk")
+                    info.buildId = try await client.getProperty("ro.build.id")
+                    info.serialNumber = try await client.getProperty("ro.serialno")
+                } catch {
+                    self?.log("Failed to fetch device info: \(error.localizedDescription)")
+                }
+
+                DispatchQueue.main.async {
+                    self?.deviceInfo = info
+                    if !info.isEmpty {
+                        self?.log("Device: \(info.displayName) (Android \(info.androidVersion))")
+                    }
                 }
             }
         }
@@ -267,26 +450,30 @@ final class ADBManager: ObservableObject {
         }
     }
 
-    func refreshApps(includeSystem: Bool = false) {
+    func refreshApps(includeSystem: Bool? = nil) {
         guard let client else {
             log("No device connected.")
             return
         }
 
+        let shouldIncludeSystem = includeSystem ?? self.includeSystemApps
         isLoadingApps = true
         appsError = nil
+        iconLoadingCount = 0
+        totalIconsToLoad = 0
         log("Fetching installed apps...")
 
         workerQueue.async { [weak self] in
             guard let self else { return }
             Task {
                 do {
-                    let fetched = try await client.fetchInstalledApps(includeSystem: includeSystem)
+                    let fetched = try await client.fetchInstalledApps(includeSystem: shouldIncludeSystem)
                     DispatchQueue.main.async {
                         self.apps = fetched
                         self.isLoadingApps = false
                         self.appsError = nil
                         self.log("Loaded \(fetched.count) apps.")
+                        self.preloadVisibleIcons()
                     }
                 } catch {
                     DispatchQueue.main.async {
@@ -296,6 +483,42 @@ final class ADBManager: ObservableObject {
                         self.log("Error: \(String(reflecting: error))")
                     }
                 }
+            }
+        }
+    }
+
+    private func preloadVisibleIcons() {
+        let appsNeedingIcons = apps.filter { app in
+            app.iconData == nil && app.apkPath != nil && !iconLoadsInProgress.contains(app.packageName)
+        }
+
+        totalIconsToLoad = appsNeedingIcons.count
+        iconLoadingCount = 0
+
+        let batchSize = 5
+        let batch = Array(appsNeedingIcons.prefix(batchSize))
+        for app in batch {
+            loadIcon(for: app)
+        }
+    }
+
+    func clearIconCache() {
+        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+            ?? FileManager.default.temporaryDirectory
+        let cacheDir = base.appendingPathComponent("IconCache", isDirectory: true)
+
+        do {
+            if FileManager.default.fileExists(atPath: cacheDir.path) {
+                try FileManager.default.removeItem(at: cacheDir)
+                log("Icon cache cleared")
+            }
+        } catch {
+            log("Failed to clear icon cache: \(error.localizedDescription)")
+        }
+
+        DispatchQueue.main.async {
+            for index in self.apps.indices {
+                self.apps[index].iconData = nil
             }
         }
     }
@@ -320,6 +543,12 @@ final class ADBManager: ObservableObject {
         guard beginIconLoad(for: app.packageName) else { return }
         let packageName = app.packageName
 
+        DispatchQueue.main.async {
+            if let index = self.apps.firstIndex(where: { $0.packageName == packageName }) {
+                self.apps[index].isLoadingIcon = true
+            }
+        }
+
         iconQueue.async { [weak self] in
             guard let self else { return }
 
@@ -328,6 +557,7 @@ final class ADBManager: ObservableObject {
                let data = try? Data(contentsOf: cacheURL) {
                 DispatchQueue.main.async {
                     self.updateAppIcon(package: packageName, data: data)
+                    self.incrementIconLoadCount()
                 }
                 self.endIconLoad(for: packageName)
                 return
@@ -343,7 +573,7 @@ final class ADBManager: ObservableObject {
                     if let iconData = APKIconExtractor.extractIcon(from: tempApkURL) {
                         guard let finalData = self.normalizeIconData(iconData) else {
                             DispatchQueue.main.async {
-                                self.log("Icon decode failed for \(packageName).")
+                                self.updateAppIconLoadingState(package: packageName, loading: false)
                             }
                             return
                         }
@@ -354,17 +584,32 @@ final class ADBManager: ObservableObject {
                         }
                     } else {
                         DispatchQueue.main.async {
-                            self.log("Icon not found for \(packageName).")
+                            self.updateAppIconLoadingState(package: packageName, loading: false)
                         }
                     }
+
+                    try? FileManager.default.removeItem(at: tempApkURL)
                 } catch {
                     DispatchQueue.main.async {
-                        self.log("Icon fetch failed for \(packageName): \(error.localizedDescription)")
+                        self.updateAppIconLoadingState(package: packageName, loading: false)
                     }
                 }
 
+                DispatchQueue.main.async {
+                    self.incrementIconLoadCount()
+                }
                 self.endIconLoad(for: packageName)
             }
+        }
+    }
+
+    private func incrementIconLoadCount() {
+        iconLoadingCount += 1
+    }
+
+    private func updateAppIconLoadingState(package: String, loading: Bool) {
+        if let index = apps.firstIndex(where: { $0.packageName == package }) {
+            apps[index].isLoadingIcon = loading
         }
     }
 
@@ -498,6 +743,7 @@ final class ADBManager: ObservableObject {
     private func updateAppIcon(package: String, data: Data) {
         if let index = apps.firstIndex(where: { $0.packageName == package }) {
             apps[index].iconData = data
+            apps[index].isLoadingIcon = false
         }
     }
 
@@ -558,8 +804,10 @@ private final class ADBClient {
     private var dataPacketCount: Int = 0
     private var okayPacketCount: Int = 0
     private let opQueue = ADBOperationQueue()
+    private let timeout: TimeInterval
 
-    init(logger: ((String) -> Void)? = nil) {
+    init(timeout: TimeInterval = 8.0, logger: ((String) -> Void)? = nil) {
+        self.timeout = timeout
         self.logger = logger
     }
 
@@ -573,7 +821,7 @@ private final class ADBClient {
         guard !host.isEmpty else { throw ADBError.invalidHost }
 
         let connection = ADBConnection(host: host, port: port, logger: logger)
-        try await connection.start()
+        try await connection.start(timeout: timeout)
         self.connection = connection
 
         let keyPair = try ADBKeyManager.loadOrCreateKeyPair(at: keyStoragePath)
@@ -789,6 +1037,17 @@ private final class ADBClient {
         try await enqueue {
             _ = try await self.runShell("input keyevent \(keyCode)")
         }
+    }
+
+    func runShellCommand(_ command: String) async throws -> String {
+        try await enqueue {
+            try await self.runShell(command)
+        }
+    }
+
+    func getProperty(_ property: String) async throws -> String {
+        let output = try await runShellCommand("getprop \(property)")
+        return output.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     private func fetchPackageDetails(_ package: String) async throws -> (label: String?, versionName: String?, installer: String?, isSystem: Bool?, codePath: String?) {

@@ -10,6 +10,7 @@ struct InstallView: View {
     @State private var selectedApk: ApkItem?
     @State private var showFileImporter = false
     @State private var fileImportError: String?
+    @State private var isScanning = false
 
     var body: some View {
         NavigationStack {
@@ -18,7 +19,13 @@ struct InstallView: View {
 
                 ScrollView {
                     VStack(spacing: 20) {
-                        headerSection
+                        PageHeader(
+                            title: "Install",
+                            subtitle: "Sideload APKs to your device",
+                            icon: "square.and.arrow.down.fill"
+                        )
+
+                        installProgressCard
                         directLinkSection
                         fileInstallSection
                         scanSection
@@ -31,143 +38,252 @@ struct InstallView: View {
         }
     }
 
-    private var headerSection: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Text("Install")
-                .font(BeamioTheme.titleFont(28))
-            Text("Send APKs from a link, file, or a download page.")
-                .font(BeamioTheme.bodyFont(14))
-                .foregroundColor(.secondary)
+    // MARK: - Install Progress Card
+
+    @ViewBuilder
+    private var installProgressCard: some View {
+        if adbManager.isInstalling {
+            BeamioCard {
+                VStack(alignment: .leading, spacing: 12) {
+                    HStack {
+                        Image(systemName: "arrow.down.circle.fill")
+                            .foregroundColor(BeamioTheme.accent)
+                            .font(.system(size: 20))
+
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Installing...")
+                                .font(BeamioTheme.subtitleFont(15))
+                            Text(adbManager.installStatus)
+                                .font(BeamioTheme.captionFont(12))
+                                .foregroundColor(.secondary)
+                        }
+
+                        Spacer()
+
+                        ProgressView()
+                    }
+
+                    if let progress = adbManager.installProgress {
+                        ProgressView(value: progress)
+                            .tint(BeamioTheme.accent)
+                    }
+                }
+            }
+            .transition(.move(edge: .top).combined(with: .opacity))
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(.top, 8)
     }
+
+    // MARK: - Direct Link Section
 
     private var directLinkSection: some View {
-        BeamioCard {
-            VStack(alignment: .leading, spacing: 12) {
-                Text("Direct APK Link")
-                    .font(BeamioTheme.subtitleFont(16))
+        BeamioSection("Direct Install") {
+            BeamioCard {
+                VStack(alignment: .leading, spacing: 14) {
+                    Label("APK URL", systemImage: "link")
+                        .font(BeamioTheme.subtitleFont(15))
 
-                TextField("https://example.com/app.apk", text: $directApkURL)
-                    .keyboardType(.URL)
-                    .textInputAutocapitalization(.never)
-                    .autocorrectionDisabled()
-                    .beamioTextField()
+                    TextField("https://example.com/app.apk", text: $directApkURL)
+                        .keyboardType(.URL)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                        .beamioTextField()
 
-                Button("Install Link") {
-                    let trimmed = directApkURL.trimmingCharacters(in: .whitespacesAndNewlines)
-                    guard !trimmed.isEmpty else { return }
-                    adbManager.installApk(from: trimmed)
-                }
-                .buttonStyle(PrimaryButtonStyle())
-                .disabled(directApkURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-            }
-        }
-    }
-
-    private var fileInstallSection: some View {
-        BeamioCard {
-            VStack(alignment: .leading, spacing: 12) {
-                Text("Install from File")
-                    .font(BeamioTheme.subtitleFont(16))
-
-                Button("Choose APK File") {
-                    showFileImporter = true
-                }
-                .buttonStyle(SecondaryButtonStyle())
-
-                if let fileImportError {
-                    Text(fileImportError)
-                        .font(BeamioTheme.bodyFont(12))
-                        .foregroundColor(.red)
-                }
-            }
-        }
-        .fileImporter(
-            isPresented: $showFileImporter,
-            allowedContentTypes: apkContentTypes,
-            allowsMultipleSelection: false
-        ) { result in
-            switch result {
-            case .success(let urls):
-                guard let url = urls.first else { return }
-                fileImportError = nil
-                adbManager.installApkFile(url)
-            case .failure(let error):
-                fileImportError = "File import failed: \(error.localizedDescription)"
-            }
-        }
-    }
-
-    private var scanSection: some View {
-        BeamioCard {
-            VStack(alignment: .leading, spacing: 12) {
-                Text("Scan for APKs")
-                    .font(BeamioTheme.subtitleFont(16))
-
-                TextField("https://example.com/downloads", text: $updateURL)
-                    .keyboardType(.URL)
-                    .textInputAutocapitalization(.never)
-                    .autocorrectionDisabled()
-                    .beamioTextField()
-
-                Button("Scan URL") {
-                    adbManager.scanURL(updateURL) { items in
-                        apkItems = items
-                        selectedApk = items.first(where: { $0.isPreferred }) ?? items.first
-                    }
-                }
-                .buttonStyle(SecondaryButtonStyle())
-                .disabled(updateURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-
-                if apkItems.isEmpty {
-                    Text("No APKs scanned yet.")
-                        .font(BeamioTheme.bodyFont(12))
+                    Text("Paste a direct link to an APK file to install it.")
+                        .font(BeamioTheme.captionFont(12))
                         .foregroundColor(.secondary)
-                } else {
-                    VStack(spacing: 10) {
-                        ForEach(apkItems) { item in
-                            Button {
-                                selectedApk = item
-                            } label: {
-                                HStack {
-                                    VStack(alignment: .leading, spacing: 4) {
-                                        Text(item.name)
-                                            .font(BeamioTheme.subtitleFont(14))
-                                        Text(item.url)
-                                            .font(BeamioTheme.bodyFont(11))
-                                            .foregroundColor(.secondary)
-                                            .lineLimit(1)
-                                    }
-                                    Spacer()
-                                    if item.isPreferred {
-                                        PillBadge(text: "ARM", color: BeamioTheme.accent)
-                                    }
-                                    if item == selectedApk {
-                                        Image(systemName: "checkmark.circle.fill")
-                                            .foregroundColor(BeamioTheme.accent)
-                                    }
-                                }
-                            }
-                            .buttonStyle(.plain)
-                            .padding(10)
-                            .background(
-                                RoundedRectangle(cornerRadius: 12)
-                                    .fill(Color(.secondarySystemBackground).opacity(0.7))
-                            )
-                        }
-                    }
 
-                    Button("Install Selected") {
-                        if let selectedApk {
-                            adbManager.installApk(from: selectedApk.url)
+                    Button {
+                        let trimmed = directApkURL.trimmingCharacters(in: .whitespacesAndNewlines)
+                        guard !trimmed.isEmpty else { return }
+                        adbManager.installApk(from: trimmed)
+                    } label: {
+                        HStack {
+                            Image(systemName: "arrow.down.circle")
+                            Text("Install from URL")
                         }
+                        .frame(maxWidth: .infinity)
                     }
                     .buttonStyle(PrimaryButtonStyle())
-                    .disabled(selectedApk == nil)
+                    .disabled(directApkURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || adbManager.isInstalling)
                 }
             }
+        }
+    }
+
+    // MARK: - File Install Section
+
+    private var fileInstallSection: some View {
+        BeamioSection("Local File") {
+            BeamioCard {
+                VStack(alignment: .leading, spacing: 14) {
+                    Label("Install from Device", systemImage: "doc.fill")
+                        .font(BeamioTheme.subtitleFont(15))
+
+                    Text("Select an APK file from your iPhone or iPad.")
+                        .font(BeamioTheme.captionFont(12))
+                        .foregroundColor(.secondary)
+
+                    if let fileImportError {
+                        HStack(spacing: 6) {
+                            Image(systemName: "exclamationmark.triangle.fill")
+                                .foregroundColor(BeamioTheme.destructive)
+                            Text(fileImportError)
+                                .font(BeamioTheme.bodyFont(12))
+                                .foregroundColor(BeamioTheme.destructive)
+                        }
+                    }
+
+                    Button {
+                        showFileImporter = true
+                    } label: {
+                        HStack {
+                            Image(systemName: "folder")
+                            Text("Choose APK File")
+                        }
+                        .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(SecondaryButtonStyle())
+                    .disabled(adbManager.isInstalling)
+                }
+            }
+            .fileImporter(
+                isPresented: $showFileImporter,
+                allowedContentTypes: apkContentTypes,
+                allowsMultipleSelection: false
+            ) { result in
+                switch result {
+                case .success(let urls):
+                    guard let url = urls.first else { return }
+                    fileImportError = nil
+                    adbManager.installApkFile(url)
+                case .failure(let error):
+                    fileImportError = "Import failed: \(error.localizedDescription)"
+                }
+            }
+        }
+    }
+
+    // MARK: - Scan Section
+
+    private var scanSection: some View {
+        BeamioSection("Scan Web Page") {
+            BeamioCard {
+                VStack(alignment: .leading, spacing: 14) {
+                    Label("Find APKs", systemImage: "magnifyingglass")
+                        .font(BeamioTheme.subtitleFont(15))
+
+                    TextField("https://example.com/downloads", text: $updateURL)
+                        .keyboardType(.URL)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                        .beamioTextField()
+
+                    Text("Scan a web page to find APK download links.")
+                        .font(BeamioTheme.captionFont(12))
+                        .foregroundColor(.secondary)
+
+                    Button {
+                        performScan()
+                    } label: {
+                        HStack {
+                            if isScanning {
+                                ProgressView()
+                                    .scaleEffect(0.8)
+                                    .tint(.primary)
+                            } else {
+                                Image(systemName: "doc.text.magnifyingglass")
+                            }
+                            Text(isScanning ? "Scanning..." : "Scan URL")
+                        }
+                        .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(SecondaryButtonStyle())
+                    .disabled(updateURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || isScanning)
+
+                    if !apkItems.isEmpty {
+                        BeamioDivider()
+                            .padding(.vertical, 4)
+
+                        VStack(alignment: .leading, spacing: 8) {
+                            HStack {
+                                Text("Found APKs")
+                                    .font(BeamioTheme.captionFont(12))
+                                    .foregroundColor(.secondary)
+
+                                Spacer()
+
+                                Text("\(apkItems.count) files")
+                                    .font(BeamioTheme.captionFont(11))
+                                    .foregroundColor(.secondary)
+                            }
+
+                            ForEach(apkItems) { item in
+                                apkItemRow(item)
+                            }
+                        }
+
+                        Button {
+                            if let selectedApk {
+                                adbManager.installApk(from: selectedApk.url)
+                            }
+                        } label: {
+                            HStack {
+                                Image(systemName: "arrow.down.circle.fill")
+                                Text("Install Selected")
+                            }
+                            .frame(maxWidth: .infinity)
+                        }
+                        .buttonStyle(PrimaryButtonStyle())
+                        .disabled(selectedApk == nil || adbManager.isInstalling)
+                    }
+                }
+            }
+        }
+    }
+
+    private func apkItemRow(_ item: ApkItem) -> some View {
+        Button {
+            selectedApk = item
+        } label: {
+            HStack {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(item.name)
+                        .font(BeamioTheme.bodyFont(14))
+                        .foregroundColor(.primary)
+                        .lineLimit(2)
+
+                    Text(item.url)
+                        .font(BeamioTheme.captionFont(11))
+                        .foregroundColor(.secondary)
+                        .lineLimit(1)
+                }
+
+                Spacer()
+
+                if item.isPreferred {
+                    PillBadge(text: "ARM", color: BeamioTheme.accent, icon: "cpu")
+                }
+
+                if item == selectedApk {
+                    Image(systemName: "checkmark.circle.fill")
+                        .foregroundColor(BeamioTheme.accent)
+                        .font(.system(size: 20))
+                }
+            }
+            .listRowStyle()
+        }
+        .buttonStyle(.plain)
+    }
+
+    private func performScan() {
+        isScanning = true
+        apkItems = []
+        selectedApk = nil
+
+        adbManager.scanURL(updateURL) { items in
+            apkItems = items
+            selectedApk = items.first(where: { $0.isPreferred }) ?? items.first
+            isScanning = false
         }
     }
 

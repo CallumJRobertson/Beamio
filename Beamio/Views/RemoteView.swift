@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 
 struct RemoteView: View {
     @EnvironmentObject private var adbManager: ADBManager
@@ -8,112 +9,252 @@ struct RemoteView: View {
             ZStack {
                 AppBackground()
 
-                VStack(spacing: 24) {
-                    headerSection
-                    dpadSection
-                    actionSection
+                ScrollView {
+                    VStack(spacing: 24) {
+                        PageHeader(
+                            title: "Remote",
+                            subtitle: "Control your Fire TV device",
+                            icon: "appletvremote.gen1.fill"
+                        )
+
+                        deviceStatusBanner
+
+                        dpadSection
+                        mediaControlsSection
+                        navigationSection
+                        powerSection
+                    }
+                    .padding(.horizontal, 20)
+                    .padding(.bottom, 32)
                 }
-                .padding(.horizontal, 20)
-                .padding(.bottom, 32)
             }
             .navigationTitle("")
         }
     }
 
-    private var headerSection: some View {
-        VStack(spacing: 6) {
-            Text("Remote")
-                .font(BeamioTheme.titleFont(28))
-            Text("Control navigation, playback, and menus.")
-                .font(BeamioTheme.bodyFont(14))
-                .foregroundColor(.secondary)
+    // MARK: - Device Status Banner
+
+    @ViewBuilder
+    private var deviceStatusBanner: some View {
+        if adbManager.isConnected {
+            HStack(spacing: 10) {
+                Image(systemName: "tv.fill")
+                    .foregroundColor(BeamioTheme.success)
+                Text(adbManager.deviceInfo.displayName)
+                    .font(BeamioTheme.captionFont(13))
+
+                Spacer()
+
+                StatusIndicator(isActive: true, size: 8)
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 10)
+            .background(BeamioTheme.success.opacity(0.1))
+            .cornerRadius(12)
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(.top, 8)
     }
+
+    // MARK: - D-Pad Section
 
     private var dpadSection: some View {
         BeamioCard {
-            VStack(spacing: 16) {
-                remoteButton(icon: "chevron.up", action: { adbManager.sendKeyEvent(19) })
+            VStack(spacing: 8) {
+                Text("Navigation")
+                    .font(BeamioTheme.captionFont(12))
+                    .foregroundColor(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
 
-                HStack(spacing: 40) {
-                    remoteButton(icon: "chevron.left", action: { adbManager.sendKeyEvent(21) })
+                VStack(spacing: 12) {
+                    remoteButton(icon: "chevron.up", keyCode: 19)
 
-                    Button {
-                        adbManager.sendKeyEvent(23)
-                    } label: {
-                        Text("OK")
-                            .font(BeamioTheme.subtitleFont(16))
-                            .frame(width: 68, height: 68)
+                    HStack(spacing: 32) {
+                        remoteButton(icon: "chevron.left", keyCode: 21)
+
+                        Button {
+                            sendKey(23)
+                        } label: {
+                            Text("OK")
+                                .font(BeamioTheme.subtitleFont(16))
+                                .frame(width: 72, height: 72)
+                        }
+                        .buttonStyle(RemotePrimaryButtonStyle())
+
+                        remoteButton(icon: "chevron.right", keyCode: 22)
                     }
-                    .buttonStyle(RemotePrimaryButtonStyle())
 
-                    remoteButton(icon: "chevron.right", action: { adbManager.sendKeyEvent(22) })
+                    remoteButton(icon: "chevron.down", keyCode: 20)
                 }
-
-                remoteButton(icon: "chevron.down", action: { adbManager.sendKeyEvent(20) })
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 16)
             }
-            .frame(maxWidth: .infinity)
         }
     }
 
-    private var actionSection: some View {
+    // MARK: - Media Controls Section
+
+    private var mediaControlsSection: some View {
         BeamioCard {
             VStack(spacing: 12) {
-                HStack(spacing: 12) {
-                    Button("Back") { adbManager.sendKeyEvent(4) }
-                        .buttonStyle(SecondaryButtonStyle())
-                    Button("Home") { adbManager.sendKeyEvent(3) }
-                        .buttonStyle(SecondaryButtonStyle())
-                    Button("Menu") { adbManager.sendKeyEvent(82) }
-                        .buttonStyle(SecondaryButtonStyle())
+                Text("Media")
+                    .font(BeamioTheme.captionFont(12))
+                    .foregroundColor(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+
+                HStack(spacing: 16) {
+                    mediaButton(icon: "backward.fill", keyCode: 89)
+                    mediaButton(icon: "playpause.fill", keyCode: 85, isPrimary: true)
+                    mediaButton(icon: "forward.fill", keyCode: 90)
                 }
 
-                Button("Play / Pause") {
-                    adbManager.sendKeyEvent(85)
+                BeamioDivider()
+                    .padding(.vertical, 4)
+
+                HStack(spacing: 16) {
+                    VStack(spacing: 8) {
+                        volumeButton(icon: "speaker.wave.3.fill", keyCode: 24)
+                        Text("Vol +")
+                            .font(BeamioTheme.captionFont(10))
+                            .foregroundColor(.secondary)
+                    }
+
+                    VStack(spacing: 8) {
+                        volumeButton(icon: "speaker.slash.fill", keyCode: 164)
+                        Text("Mute")
+                            .font(BeamioTheme.captionFont(10))
+                            .foregroundColor(.secondary)
+                    }
+
+                    VStack(spacing: 8) {
+                        volumeButton(icon: "speaker.wave.1.fill", keyCode: 25)
+                        Text("Vol -")
+                            .font(BeamioTheme.captionFont(10))
+                            .foregroundColor(.secondary)
+                    }
                 }
-                .buttonStyle(SecondaryButtonStyle())
             }
-            .frame(maxWidth: .infinity)
         }
     }
 
-    private func remoteButton(icon: String, action: @escaping () -> Void) -> some View {
-        Button(action: action) {
+    // MARK: - Navigation Section
+
+    private var navigationSection: some View {
+        BeamioCard {
+            VStack(spacing: 12) {
+                Text("Navigation")
+                    .font(BeamioTheme.captionFont(12))
+                    .foregroundColor(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+
+                HStack(spacing: 12) {
+                    actionButton(title: "Back", icon: "arrow.uturn.backward", keyCode: 4)
+                    actionButton(title: "Home", icon: "house.fill", keyCode: 3)
+                    actionButton(title: "Menu", icon: "line.3.horizontal", keyCode: 82)
+                }
+
+                HStack(spacing: 12) {
+                    actionButton(title: "Recent", icon: "square.stack", keyCode: 187)
+                    actionButton(title: "Voice", icon: "mic.fill", keyCode: 79)
+                    actionButton(title: "Search", icon: "magnifyingglass", keyCode: 84)
+                }
+            }
+        }
+    }
+
+    // MARK: - Power Section
+
+    private var powerSection: some View {
+        BeamioCard {
+            VStack(spacing: 12) {
+                Text("Power")
+                    .font(BeamioTheme.captionFont(12))
+                    .foregroundColor(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+
+                HStack(spacing: 12) {
+                    Button {
+                        sendKey(26) // Power
+                    } label: {
+                        HStack(spacing: 8) {
+                            Image(systemName: "power")
+                            Text("Sleep")
+                        }
+                        .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(SecondaryButtonStyle())
+
+                    Button {
+                        sendKey(223) // Sleep (some devices)
+                    } label: {
+                        HStack(spacing: 8) {
+                            Image(systemName: "moon.fill")
+                            Text("Screensaver")
+                        }
+                        .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(SecondaryButtonStyle())
+                }
+            }
+        }
+    }
+
+    // MARK: - Button Helpers
+
+    private func remoteButton(icon: String, keyCode: Int) -> some View {
+        Button {
+            sendKey(keyCode)
+        } label: {
             Image(systemName: icon)
-                .font(.system(size: 18, weight: .semibold))
-                .frame(width: 52, height: 52)
+                .font(.system(size: 20, weight: .semibold))
+                .frame(width: 56, height: 56)
         }
         .buttonStyle(RemoteButtonStyle())
     }
-}
 
-struct RemoteButtonStyle: ButtonStyle {
-    func makeBody(configuration: Configuration) -> some View {
-        configuration.label
-            .background(
-                Circle()
-                    .fill(Color(.secondarySystemBackground).opacity(configuration.isPressed ? 0.7 : 0.9))
-            )
-            .overlay(
-                Circle()
-                    .stroke(Color.white.opacity(0.08), lineWidth: 1)
-            )
-            .foregroundColor(.primary)
+    private func mediaButton(icon: String, keyCode: Int, isPrimary: Bool = false) -> some View {
+        Button {
+            sendKey(keyCode)
+        } label: {
+            Image(systemName: icon)
+                .font(.system(size: 18))
+                .frame(width: 60, height: 48)
+        }
+        .buttonStyle(isPrimary ? AnyButtonStyle(RemotePrimaryButtonStyle()) : AnyButtonStyle(RemoteButtonStyle()))
+    }
+
+    private func volumeButton(icon: String, keyCode: Int) -> some View {
+        Button {
+            sendKey(keyCode)
+        } label: {
+            Image(systemName: icon)
+                .font(.system(size: 16))
+                .frame(width: 52, height: 44)
+        }
+        .buttonStyle(RemoteButtonStyle())
+    }
+
+    private func actionButton(title: String, icon: String, keyCode: Int) -> some View {
+        Button {
+            sendKey(keyCode)
+        } label: {
+            VStack(spacing: 6) {
+                Image(systemName: icon)
+                    .font(.system(size: 16))
+                Text(title)
+                    .font(BeamioTheme.captionFont(11))
+            }
+            .frame(maxWidth: .infinity)
+            .frame(height: 56)
+        }
+        .buttonStyle(SecondaryButtonStyle())
+    }
+
+    private func sendKey(_ keyCode: Int) {
+        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+        adbManager.sendKeyEvent(keyCode)
     }
 }
 
-struct RemotePrimaryButtonStyle: ButtonStyle {
-    func makeBody(configuration: Configuration) -> some View {
-        configuration.label
-            .background(
-                Circle()
-                    .fill(BeamioTheme.accent.opacity(configuration.isPressed ? 0.8 : 1.0))
-            )
-            .foregroundColor(.white)
-    }
-}
+// MARK: - Previews
 
 #Preview {
     RemoteView()
