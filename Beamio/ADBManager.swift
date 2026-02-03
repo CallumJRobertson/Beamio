@@ -265,6 +265,7 @@ private final class ADBClient {
     private var connection: ADBConnection?
     private var nextLocalId: UInt32 = 1
     private var keyPair: ADBKeyPair?
+    private var maxData: Int = 4096
 
     init(logger: ((String) -> Void)? = nil) {
         self.logger = logger
@@ -280,7 +281,8 @@ private final class ADBClient {
         let keyPair = try ADBKeyManager.loadOrCreateKeyPair(at: keyStoragePath)
         self.keyPair = keyPair
 
-        try await sendPacket(.cnxn, arg0: 0x01000000, arg1: 4096, data: Data("host::".utf8))
+        let localMaxData: UInt32 = 4096
+        try await sendPacket(.cnxn, arg0: 0x01000000, arg1: localMaxData, data: Data("host::".utf8))
 
         var sentSignature = false
         var sentPublicKey = false
@@ -289,6 +291,9 @@ private final class ADBClient {
             let packet = try await readPacket()
             switch packet.command {
             case .cnxn:
+                let remoteMax = Int(packet.arg1)
+                maxData = max(256, remoteMax)
+                trace("Negotiated max data size: \(maxData) bytes")
                 return
             case .auth:
                 if !sentSignature, packet.arg0 == 1 {
@@ -380,8 +385,14 @@ private final class ADBClient {
         let handle = try FileHandle(forReadingFrom: localURL)
         defer { try? handle.close() }
 
+        let maxPayload = max(256, maxData)
+        let maxChunk = maxPayload > 8 ? (maxPayload - 8) : 0
+        guard maxChunk > 0 else {
+            throw ADBError.protocolError("Invalid max payload size: \(maxPayload)")
+        }
+
         while true {
-            let chunk = try handle.read(upToCount: 64 * 1024) ?? Data()
+            let chunk = try handle.read(upToCount: maxChunk) ?? Data()
             if chunk.isEmpty { break }
             try await writeSyncCommand(stream: stream, id: "DATA", data: chunk, buffer: &buffer)
         }
@@ -520,6 +531,10 @@ private final class ADBClient {
 
     private func sendPacket(_ command: ADBCommand, arg0: UInt32, arg1: UInt32, data: Data) async throws {
         guard let connection else { throw ADBError.connectionClosed }
+
+        if command != .cnxn, data.count > maxData {
+            throw ADBError.protocolError("Payload too large: \(data.count) > \(maxData)")
+        }
 
         let checksum = data.reduce(UInt32(0)) { $0 + UInt32($1) }
         let magic = command.rawValue ^ 0xFFFFFFFF
