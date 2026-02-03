@@ -445,7 +445,9 @@ private final class ADBClient {
             return Data(slice)
         }
 
-        let sendPath = "\(remotePath),\(String(format: "%o", mode))"
+        let modeString = String(format: "%#o", mode)
+        trace("Sending file mode \(modeString) to \(remotePath)")
+        let sendPath = "\(remotePath),\(modeString)"
         try await writeSyncCommand(stream: stream, id: "SEND", data: Data(sendPath.utf8), buffer: &buffer)
 
         let handle = try FileHandle(forReadingFrom: localURL)
