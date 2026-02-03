@@ -408,7 +408,7 @@ private final class ADBClient {
         }
     }
 
-    func installApk(at localURL: URL, progress: (String, Double?) -> Void) async throws {
+    func installApk(at localURL: URL, progress: @escaping (String, Double?) -> Void) async throws {
         progress("Uploading APK...", 0)
         try await pushFile(localURL: localURL, remotePath: "/data/local/tmp/beamio_payload.apk", mode: 0o644) { sent, total in
             if let total, total > 0 {
@@ -435,7 +435,7 @@ private final class ADBClient {
         return String(data: data, encoding: .utf8) ?? ""
     }
 
-    private func pushFile(localURL: URL, remotePath: String, mode: Int, progress: ((Int64, Int64?) -> Void)? = nil) async throws {
+    private func pushFile(localURL: URL, remotePath: String, mode: Int, progress: (@escaping (Int64, Int64?) -> Void)? = nil) async throws {
         let stream = try await openStream(service: "sync:")
         var buffer = Data()
         var bufferOffset = 0
