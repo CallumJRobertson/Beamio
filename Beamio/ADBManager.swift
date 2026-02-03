@@ -52,6 +52,9 @@ final class ADBManager: ObservableObject {
 
     @Published var connectionStatus: String = "Disconnected"
     @Published var logLines: [String] = []
+    @Published var installStatus: String = "Idle"
+    @Published var installProgress: Double? = nil
+    @Published var isInstalling: Bool = false
 
     private let maxLogLines = 800
     private let workerQueue = DispatchQueue(label: "com.beamio.adb.worker", qos: .userInitiated)
@@ -139,17 +142,20 @@ final class ADBManager: ObservableObject {
             return
         }
 
+        updateInstall(status: "Downloading APK...", progress: nil, active: true)
         URLSession.shared.downloadTask(with: downloadURL) { [weak self] tempURL, _, error in
             guard let self else { return }
             if let error {
                 DispatchQueue.main.async {
                     self.log("Download failed: \(error.localizedDescription)")
+                    self.updateInstall(status: "Download failed", progress: nil, active: false)
                 }
                 return
             }
             guard let tempURL else {
                 DispatchQueue.main.async {
                     self.log("Download failed: missing file.")
+                    self.updateInstall(status: "Download failed", progress: nil, active: false)
                 }
                 return
             }
@@ -163,6 +169,7 @@ final class ADBManager: ObservableObject {
             } catch {
                 DispatchQueue.main.async {
                     self.log("Failed to prepare APK: \(error.localizedDescription)")
+                    self.updateInstall(status: "Failed to prepare APK", progress: nil, active: false)
                 }
                 return
             }
@@ -170,15 +177,16 @@ final class ADBManager: ObservableObject {
             self.workerQueue.async {
                 Task {
                     do {
-                        try await client.installApk(at: targetURL) { [weak self] update in
-                            DispatchQueue.main.async {
-                                self?.log(update)
-                            }
+                        self.updateInstall(status: "Uploading APK...", progress: 0, active: true)
+                        try await client.installApk(at: targetURL) { [weak self] status, fraction in
+                            self?.handleInstallProgress(status: status, progress: fraction)
                         }
+                        self.updateInstall(status: "Install complete.", progress: 1, active: false)
                     } catch {
                         DispatchQueue.main.async {
                             self.log("Install failed: \(error.localizedDescription)")
                             self.log("Error: \(String(reflecting: error))")
+                            self.updateInstall(status: "Install failed", progress: nil, active: false)
                         }
                     }
                 }
@@ -195,6 +203,7 @@ final class ADBManager: ObservableObject {
 
         workerQueue.async {
             Task {
+                self.updateInstall(status: "Preparing APK...", progress: nil, active: true)
                 let didAccess = fileURL.startAccessingSecurityScopedResource()
                 defer {
                     if didAccess {
@@ -212,20 +221,22 @@ final class ADBManager: ObservableObject {
                     DispatchQueue.main.async {
                         self.log("Failed to read APK file: \(error.localizedDescription)")
                         self.log("Error: \(String(reflecting: error))")
+                        self.updateInstall(status: "Failed to read APK file", progress: nil, active: false)
                     }
                     return
                 }
 
                 do {
-                    try await client.installApk(at: targetURL) { [weak self] update in
-                        DispatchQueue.main.async {
-                            self?.log(update)
-                        }
+                    self.updateInstall(status: "Uploading APK...", progress: 0, active: true)
+                    try await client.installApk(at: targetURL) { [weak self] status, fraction in
+                        self?.handleInstallProgress(status: status, progress: fraction)
                     }
+                    self.updateInstall(status: "Install complete.", progress: 1, active: false)
                 } catch {
                     DispatchQueue.main.async {
                         self.log("Install failed: \(error.localizedDescription)")
                         self.log("Error: \(String(reflecting: error))")
+                        self.updateInstall(status: "Install failed", progress: nil, active: false)
                     }
                 }
             }
@@ -312,6 +323,34 @@ final class ADBManager: ObservableObject {
         formatter.dateFormat = "HH:mm:ss"
         return formatter.string(from: Date())
     }
+
+    private func handleInstallProgress(status: String, progress: Double?) {
+        let message: String
+        if let progress {
+            let percent = Int((progress * 100).rounded())
+            message = "\(status) \(percent)%"
+        } else {
+            message = status
+        }
+        DispatchQueue.main.async { [weak self] in
+            self?.log(message)
+            self?.updateInstall(status: status, progress: progress, active: true)
+        }
+    }
+
+    private func updateInstall(status: String, progress: Double?, active: Bool) {
+        if Thread.isMainThread {
+            installStatus = status
+            installProgress = progress
+            isInstalling = active
+        } else {
+            DispatchQueue.main.async { [weak self] in
+                self?.installStatus = status
+                self?.installProgress = progress
+                self?.isInstalling = active
+            }
+        }
+    }
 }
 
 private final class ADBClient {
@@ -369,16 +408,25 @@ private final class ADBClient {
         }
     }
 
-    func installApk(at localURL: URL, progress: (String) -> Void) async throws {
-        progress("Uploading APK...")
-        try await pushFile(localURL: localURL, remotePath: "/data/local/tmp/beamio_payload.apk", mode: 0o644)
+    func installApk(at localURL: URL, progress: (String, Double?) -> Void) async throws {
+        progress("Uploading APK...", 0)
+        try await pushFile(localURL: localURL, remotePath: "/data/local/tmp/beamio_payload.apk", mode: 0o644) { sent, total in
+            if let total, total > 0 {
+                progress("Uploading APK...", Double(sent) / Double(total))
+            } else {
+                progress("Uploading APK...", nil)
+            }
+        }
 
-        progress("Installing APK...")
+        progress("Installing APK...", nil)
         let output = try await runShell("pm install -r /data/local/tmp/beamio_payload.apk")
-        progress(output.trimmingCharacters(in: .whitespacesAndNewlines))
+        let trimmed = output.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmed.isEmpty {
+            progress(trimmed, nil)
+        }
 
         _ = try? await runShell("rm /data/local/tmp/beamio_payload.apk")
-        progress("Install complete.")
+        progress("Install complete.", 1)
     }
 
     private func runShell(_ command: String) async throws -> String {
@@ -387,7 +435,7 @@ private final class ADBClient {
         return String(data: data, encoding: .utf8) ?? ""
     }
 
-    private func pushFile(localURL: URL, remotePath: String, mode: Int) async throws {
+    private func pushFile(localURL: URL, remotePath: String, mode: Int, progress: ((Int64, Int64?) -> Void)? = nil) async throws {
         let stream = try await openStream(service: "sync:")
         var buffer = Data()
         var bufferOffset = 0
@@ -466,9 +514,11 @@ private final class ADBClient {
             sentBytes += Int64(chunk.count)
             if sentBytes >= nextProgress {
                 if let fileSize, fileSize > 0 {
+                    progress?(sentBytes, fileSize)
                     let percent = Int((Double(sentBytes) / Double(fileSize)) * 100)
                     trace("Upload progress: \(percent)% (\(sentBytes)/\(fileSize) bytes)")
                 } else {
+                    progress?(sentBytes, nil)
                     trace("Upload progress: \(sentBytes) bytes")
                 }
                 nextProgress = sentBytes + progressStep

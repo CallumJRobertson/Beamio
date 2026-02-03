@@ -21,6 +21,7 @@ struct DashboardView: View {
         NavigationView {
             VStack(spacing: 16) {
                 statusSection
+                installStatusSection
                 actionSection
                 apkListSection
             }
@@ -41,6 +42,25 @@ struct DashboardView: View {
             Text(adbManager.connectionStatus)
                 .font(.subheadline)
                 .foregroundColor(.secondary)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private var installStatusSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Install Status")
+                .font(.headline)
+            Text(adbManager.installStatus)
+                .font(.subheadline)
+                .foregroundColor(.secondary)
+
+            if let progress = adbManager.installProgress {
+                ProgressView(value: progress)
+                    .progressViewStyle(.linear)
+            } else if adbManager.isInstalling {
+                ProgressView()
+                    .progressViewStyle(.linear)
+            }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
     }
