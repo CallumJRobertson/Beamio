@@ -27,6 +27,12 @@ final class PythonManager: ObservableObject {
         guard !isInitialized else { return }
         isInitialized = true
 
+        if let resourcePath = Bundle.main.resourcePath {
+            configurePythonEnvironment(resourcePath: resourcePath)
+        } else {
+            log("Missing bundle resource path; Python environment not configured.")
+        }
+
         if let pythonLibraryPath = pythonLibraryPath() {
             PythonLibrary.useLibrary(at: pythonLibraryPath)
         } else {
@@ -73,6 +79,37 @@ final class PythonManager: ObservableObject {
             connectionStatus = "Python unavailable"
             log("Python import failed: \(error)")
         }
+    }
+
+    private func configurePythonEnvironment(resourcePath: String) {
+        let stdlibPath = "\(resourcePath)/python3.13"
+        let stdlibZipPath = "\(resourcePath)/python3.13.zip"
+        let bundledSitePackages = "\(resourcePath)/site-packages"
+        let stdlibSitePackages = "\(stdlibPath)/site-packages"
+
+        var pythonPathEntries: [String] = []
+        if FileManager.default.fileExists(atPath: stdlibPath) {
+            pythonPathEntries.append(stdlibPath)
+        }
+        if FileManager.default.fileExists(atPath: stdlibZipPath) {
+            pythonPathEntries.append(stdlibZipPath)
+        }
+        if FileManager.default.fileExists(atPath: bundledSitePackages) {
+            pythonPathEntries.append(bundledSitePackages)
+        }
+        if FileManager.default.fileExists(atPath: stdlibSitePackages) {
+            pythonPathEntries.append(stdlibSitePackages)
+        }
+
+        if pythonPathEntries.isEmpty {
+            log("Python stdlib not found; PYTHONPATH not configured.")
+            return
+        }
+
+        setenv("PYTHONHOME", resourcePath, 1)
+        setenv("PYTHONPATH", pythonPathEntries.joined(separator: ":"), 1)
+        setenv("PYTHONNOUSERSITE", "1", 1)
+        setenv("PYTHONDONTWRITEBYTECODE", "1", 1)
     }
 
     private func pythonLibraryPath() -> String? {
