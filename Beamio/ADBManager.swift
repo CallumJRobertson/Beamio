@@ -15,6 +15,7 @@ struct ApkItem: Identifiable, Hashable {
 enum ADBError: Error, LocalizedError {
     case invalidHost
     case connectionClosed
+    case connectionTimeout
     case protocolError(String)
     case authenticationFailed
     case streamClosed
@@ -28,6 +29,8 @@ enum ADBError: Error, LocalizedError {
             return "Invalid host"
         case .connectionClosed:
             return "Connection closed"
+        case .connectionTimeout:
+            return "Connection timed out"
         case .protocolError(let message):
             return "Protocol error: \(message)"
         case .authenticationFailed:
@@ -57,8 +60,9 @@ final class ADBManager: ObservableObject {
 
     func connect(ipAddress: String, keyStoragePath: String, completion: ((String) -> Void)? = nil) {
         let targetIP = ipAddress.trimmingCharacters(in: .whitespacesAndNewlines)
+        let (host, port) = Self.parseHostPort(from: targetIP)
         connectionStatus = "Connecting..."
-        log("Connecting to \(targetIP)...")
+        log("Connecting to \(host):\(port)...")
 
         workerQueue.async { [weak self] in
             guard let self else { return }
@@ -66,7 +70,7 @@ final class ADBManager: ObservableObject {
             Task {
                 let result: String
                 do {
-                    try await client.connect(host: targetIP, port: 5555, keyStoragePath: keyStoragePath)
+                    try await client.connect(host: host, port: port, keyStoragePath: keyStoragePath)
                     self.client = client
                     result = "Connected"
                 } catch {
@@ -207,6 +211,31 @@ final class ADBManager: ObservableObject {
         }
 
         return results
+    }
+
+    private static func parseHostPort(from input: String) -> (String, UInt16) {
+        let trimmed = input.trimmingCharacters(in: .whitespacesAndNewlines)
+        let defaultPort: UInt16 = 5555
+
+        if trimmed.hasPrefix("["),
+           let closing = trimmed.firstIndex(of: "]"),
+           closing < trimmed.endIndex,
+           trimmed.index(after: closing) < trimmed.endIndex,
+           trimmed[trimmed.index(after: closing)] == ":" {
+            let host = String(trimmed[trimmed.index(after: trimmed.startIndex)..<closing])
+            let portStart = trimmed.index(after: closing)
+            let portString = String(trimmed[trimmed.index(after: portStart)...])
+            if let port = UInt16(portString) {
+                return (host, port)
+            }
+            return (host, defaultPort)
+        }
+
+        let parts = trimmed.split(separator: ":", maxSplits: 1).map(String.init)
+        if parts.count == 2, let port = UInt16(parts[1]) {
+            return (parts[0], port)
+        }
+        return (trimmed, defaultPort)
     }
 
     private func log(_ message: String) {
@@ -512,18 +541,38 @@ private final class ADBConnection {
         self.connection = NWConnection(host: endpoint, port: port, using: .tcp)
     }
 
-    func start() async throws {
+    func start(timeout: TimeInterval = 8) async throws {
         try await withCheckedThrowingContinuation { continuation in
             var didResume = false
+            var lastError: Error?
+            let timer = DispatchSource.makeTimerSource(queue: queue)
+            timer.schedule(deadline: .now() + timeout)
+            timer.setEventHandler {
+                guard !didResume else { return }
+                didResume = true
+                self.connection.stateUpdateHandler = nil
+                self.connection.cancel()
+                continuation.resume(throwing: lastError ?? ADBError.connectionTimeout)
+            }
+            timer.resume()
+
             connection.stateUpdateHandler = { state in
                 guard !didResume else { return }
                 switch state {
                 case .ready:
                     didResume = true
+                    timer.cancel()
                     continuation.resume()
                 case .failed(let error):
                     didResume = true
+                    timer.cancel()
                     continuation.resume(throwing: error)
+                case .waiting(let error):
+                    lastError = error
+                case .cancelled:
+                    didResume = true
+                    timer.cancel()
+                    continuation.resume(throwing: ADBError.connectionClosed)
                 default:
                     break
                 }
