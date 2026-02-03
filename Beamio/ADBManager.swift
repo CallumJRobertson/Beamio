@@ -625,7 +625,9 @@ private final class ADBClient {
         if includeSystem {
             targetPackages = Array(packagePaths.keys)
         } else if userPackages.isEmpty {
-            targetPackages = Array(packagePaths.keys)
+            targetPackages = packagePaths.compactMap { (package, path) in
+                isLikelyUserApp(path: path) ? package : nil
+            }
         } else {
             targetPackages = Array(userPackages)
         }
@@ -633,9 +635,17 @@ private final class ADBClient {
 
         for package in targetPackages.sorted() {
             let apkPath = packagePaths[package]
-            let installer = installers[package]
-            let isSystem = !userPackages.contains(package)
             let details = try? await fetchPackageDetails(package)
+            let installer = installers[package] ?? details?.installer
+
+            let isSystem: Bool
+            if !userPackages.isEmpty {
+                isSystem = !userPackages.contains(package)
+            } else if let path = apkPath {
+                isSystem = !isLikelyUserApp(path: path)
+            } else {
+                isSystem = false
+            }
             let label = details?.label?.isEmpty == false ? details!.label! : package
             let versionName = details?.versionName
             apps.append(
@@ -694,10 +704,11 @@ private final class ADBClient {
         _ = try await runShell("input keyevent \(keyCode)")
     }
 
-    private func fetchPackageDetails(_ package: String) async throws -> (label: String?, versionName: String?) {
+    private func fetchPackageDetails(_ package: String) async throws -> (label: String?, versionName: String?, installer: String?) {
         let output = try await runShell("dumpsys package \(package)")
         var label: String?
         var versionName: String?
+        var installer: String?
 
         for rawLine in output.split(separator: "\n") {
             let line = String(rawLine).trimmingCharacters(in: .whitespacesAndNewlines)
@@ -707,12 +718,37 @@ private final class ADBClient {
             if label == nil, line.hasPrefix("application-label:") {
                 label = line.replacingOccurrences(of: "application-label:", with: "").trimmingCharacters(in: .whitespacesAndNewlines)
             }
-            if versionName != nil, label != nil {
+            if installer == nil, let installerValue = parseInstaller(from: line) {
+                installer = installerValue
+            }
+            if versionName != nil, label != nil, installer != nil {
                 break
             }
         }
 
-        return (label, versionName)
+        return (label, versionName, installer)
+    }
+
+    private func parseInstaller(from line: String) -> String? {
+        guard let range = line.range(of: "installerPackageName=") else { return nil }
+        let value = line[range.upperBound...]
+        let trimmed = value.split(whereSeparator: { $0 == " " || $0 == "}" || $0 == "," }).first
+        let result = trimmed.map(String.init)?.trimmingCharacters(in: .whitespacesAndNewlines)
+        if result == nil || result == "" || result == "null" {
+            return nil
+        }
+        return result
+    }
+
+    private func isLikelyUserApp(path: String) -> Bool {
+        let lower = path.lowercased()
+        if lower.hasPrefix("/data/app/") || lower.hasPrefix("/data/user/") {
+            return true
+        }
+        if lower.hasPrefix("/data/") {
+            return true
+        }
+        return false
     }
 
     private func pushFile(localURL: URL, remotePath: String, mode: Int, progress: ((Int64, Int64?) -> Void)? = nil) async throws {

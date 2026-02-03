@@ -11,14 +11,20 @@ enum APKIconExtractor {
 
     private static func selectBestIconEntry(from entries: [ZipEntry]) -> ZipEntry? {
         let pngs = entries.filter { $0.name.lowercased().hasSuffix(".png") }
-        if pngs.isEmpty { return nil }
+        let webps = entries.filter { $0.name.lowercased().hasSuffix(".webp") }
+        let jpgs = entries.filter {
+            let lower = $0.name.lowercased()
+            return lower.hasSuffix(".jpg") || lower.hasSuffix(".jpeg")
+        }
+        let images = !pngs.isEmpty ? pngs : (!webps.isEmpty ? webps : jpgs)
+        if images.isEmpty { return nil }
 
-        let preferred = pngs.filter { name in
+        let preferred = images.filter { name in
             let lower = name.name.lowercased()
             return lower.contains("mipmap") || lower.contains("drawable")
         }
 
-        let candidates = preferred.isEmpty ? pngs : preferred
+        let candidates = preferred.isEmpty ? images : preferred
         return candidates.max { lhs, rhs in
             iconScore(for: lhs) < iconScore(for: rhs)
         }

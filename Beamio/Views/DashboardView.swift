@@ -146,7 +146,12 @@ private struct AppRow: View {
     private var isSideloaded: Bool {
         guard let installer = app.installer?.lowercased() else { return true }
         if installer.isEmpty || installer == "null" { return true }
-        let knownInstallers = ["com.android.vending", "com.amazon.venezia"]
+        let knownInstallers = [
+            "com.android.vending",
+            "com.amazon.venezia",
+            "com.amazon.appstore",
+            "com.amazon.windowshop"
+        ]
         return !knownInstallers.contains(installer)
     }
 
