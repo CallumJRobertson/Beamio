@@ -320,9 +320,22 @@ private final class ADBClient {
     private func pushFile(localURL: URL, remotePath: String, mode: Int) async throws {
         let stream = try await openStream(service: "sync:")
         var buffer = Data()
+        var bufferOffset = 0
+
+        func availableBytes() -> Int {
+            buffer.count - bufferOffset
+        }
+
+        func compactBufferIfNeeded() {
+            guard bufferOffset > 0 else { return }
+            if bufferOffset > 64 * 1024, bufferOffset > buffer.count / 2 {
+                buffer = Data(buffer[bufferOffset...])
+                bufferOffset = 0
+            }
+        }
 
         func fillBuffer(minBytes: Int) async throws {
-            while buffer.count < minBytes {
+            while availableBytes() < minBytes {
                 let packet = try await readPacket()
                 switch packet.command {
                 case .wrte:
@@ -340,11 +353,15 @@ private final class ADBClient {
 
         func readBytes(_ length: Int) async throws -> Data {
             try await fillBuffer(minBytes: length)
-            guard length <= buffer.count else {
-                throw ADBError.protocolError("Buffer underflow (needed \(length), have \(buffer.count))")
+            let available = availableBytes()
+            guard length <= available else {
+                throw ADBError.protocolError("Buffer underflow (needed \(length), have \(available))")
             }
-            let slice = buffer.prefix(length)
-            buffer.removeFirst(length)
+            let start = bufferOffset
+            let end = bufferOffset + length
+            let slice = buffer[start..<end]
+            bufferOffset = end
+            compactBufferIfNeeded()
             return Data(slice)
         }
 
