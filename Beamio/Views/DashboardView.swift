@@ -1,7 +1,7 @@
 import SwiftUI
 
 struct DashboardView: View {
-    @EnvironmentObject private var pythonManager: PythonManager
+    @EnvironmentObject private var adbManager: ADBManager
     @AppStorage("fireTVIP") private var fireTVIP: String = ""
     @AppStorage("updateURL") private var updateURL: String = ""
 
@@ -34,7 +34,7 @@ struct DashboardView: View {
         VStack(alignment: .leading, spacing: 8) {
             Text("Connection Status")
                 .font(.headline)
-            Text(pythonManager.connectionStatus)
+            Text(adbManager.connectionStatus)
                 .font(.subheadline)
                 .foregroundColor(.secondary)
         }
@@ -44,7 +44,7 @@ struct DashboardView: View {
     private var actionSection: some View {
         VStack(spacing: 12) {
             Button {
-                pythonManager.connect(ipAddress: fireTVIP, keyStoragePath: keyStoragePath)
+                adbManager.connect(ipAddress: fireTVIP, keyStoragePath: keyStoragePath)
             } label: {
                 Label("Connect", systemImage: "dot.radiowaves.left.and.right")
             }
@@ -52,7 +52,7 @@ struct DashboardView: View {
             .disabled(fireTVIP.isEmpty)
 
             Button {
-                pythonManager.scanURL(updateURL) { items in
+                adbManager.scanURL(updateURL) { items in
                     apkItems = items
                     selectedApk = items.first(where: { $0.isPreferred }) ?? items.first
                 }
@@ -64,7 +64,7 @@ struct DashboardView: View {
 
             Button {
                 if let selectedApk {
-                    pythonManager.installApk(from: selectedApk.url)
+                    adbManager.installApk(from: selectedApk.url)
                 }
             } label: {
                 Label("Install Selected APK", systemImage: "square.and.arrow.down")
@@ -122,5 +122,5 @@ struct DashboardView: View {
 
 #Preview {
     DashboardView()
-        .environmentObject(PythonManager.shared)
+        .environmentObject(ADBManager.shared)
 }

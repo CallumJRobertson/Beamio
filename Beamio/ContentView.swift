@@ -23,5 +23,5 @@ struct ContentView: View {
 
 #Preview {
     ContentView()
-        .environmentObject(PythonManager.shared)
+        .environmentObject(ADBManager.shared)
 }

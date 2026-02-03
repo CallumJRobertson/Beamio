@@ -2,12 +2,12 @@ import SwiftUI
 
 @main
 struct BeamioApp: App {
-    @StateObject private var pythonManager = PythonManager.shared
+    @StateObject private var adbManager = ADBManager.shared
 
     var body: some Scene {
         WindowGroup {
             ContentView()
-                .environmentObject(pythonManager)
+                .environmentObject(adbManager)
         }
     }
 }

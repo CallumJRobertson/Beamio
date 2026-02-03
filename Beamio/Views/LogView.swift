@@ -1,13 +1,13 @@
 import SwiftUI
 
 struct LogView: View {
-    @EnvironmentObject private var pythonManager: PythonManager
+    @EnvironmentObject private var adbManager: ADBManager
 
     var body: some View {
         NavigationView {
             ScrollView {
                 VStack(alignment: .leading, spacing: 8) {
-                    ForEach(pythonManager.logLines, id: \.self) { line in
+                    ForEach(adbManager.logLines, id: \.self) { line in
                         Text(line)
                             .font(.caption)
                             .frame(maxWidth: .infinity, alignment: .leading)
@@ -22,5 +22,5 @@ struct LogView: View {
 
 #Preview {
     LogView()
-        .environmentObject(PythonManager.shared)
+        .environmentObject(ADBManager.shared)
 }

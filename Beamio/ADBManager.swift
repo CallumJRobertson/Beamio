@@ -1,0 +1,792 @@
+import Foundation
+import Network
+import Security
+
+struct ApkItem: Identifiable, Hashable {
+    let id = UUID()
+    let name: String
+    let url: String
+
+    var isPreferred: Bool {
+        name.localizedCaseInsensitiveContains("ARM")
+    }
+}
+
+enum ADBError: Error, LocalizedError {
+    case invalidHost
+    case connectionClosed
+    case protocolError(String)
+    case authenticationFailed
+    case streamClosed
+    case syncFailed(String)
+    case invalidResponse
+    case keyGenerationFailed(String)
+
+    var errorDescription: String? {
+        switch self {
+        case .invalidHost:
+            return "Invalid host"
+        case .connectionClosed:
+            return "Connection closed"
+        case .protocolError(let message):
+            return "Protocol error: \(message)"
+        case .authenticationFailed:
+            return "ADB authentication failed"
+        case .streamClosed:
+            return "ADB stream closed"
+        case .syncFailed(let message):
+            return "ADB sync failed: \(message)"
+        case .invalidResponse:
+            return "Invalid response"
+        case .keyGenerationFailed(let message):
+            return "Key generation failed: \(message)"
+        }
+    }
+}
+
+final class ADBManager: ObservableObject {
+    static let shared = ADBManager()
+
+    @Published var connectionStatus: String = "Disconnected"
+    @Published var logLines: [String] = []
+
+    private let workerQueue = DispatchQueue(label: "com.beamio.adb.worker", qos: .userInitiated)
+    private var client: ADBClient?
+
+    private init() {}
+
+    func connect(ipAddress: String, keyStoragePath: String, completion: ((String) -> Void)? = nil) {
+        let targetIP = ipAddress.trimmingCharacters(in: .whitespacesAndNewlines)
+        connectionStatus = "Connecting..."
+        log("Connecting to \(targetIP)...")
+
+        workerQueue.async { [weak self] in
+            guard let self else { return }
+            let client = ADBClient()
+            Task {
+                let result: String
+                do {
+                    try await client.connect(host: targetIP, port: 5555, keyStoragePath: keyStoragePath)
+                    self.client = client
+                    result = "Connected"
+                } catch {
+                    self.client = nil
+                    result = "Connection failed"
+                    self.log("\(result): \(error.localizedDescription)")
+                }
+
+                DispatchQueue.main.async {
+                    self.connectionStatus = result
+                    self.log(result)
+                    completion?(result)
+                }
+            }
+        }
+    }
+
+    func scanURL(_ url: String, completion: @escaping ([ApkItem]) -> Void) {
+        let trimmed = url.trimmingCharacters(in: .whitespacesAndNewlines)
+        log("Scanning \(trimmed)...")
+
+        guard let baseURL = URL(string: trimmed) else {
+            log("Invalid URL.")
+            completion([])
+            return
+        }
+
+        URLSession.shared.dataTask(with: baseURL) { [weak self] data, _, error in
+            guard let self else { return }
+            if let error {
+                DispatchQueue.main.async {
+                    self.log("Scan failed: \(error.localizedDescription)")
+                    completion([])
+                }
+                return
+            }
+
+            let html = String(data: data ?? Data(), encoding: .utf8) ?? ""
+            let items = Self.parseApkLinks(from: html, baseURL: baseURL)
+
+            DispatchQueue.main.async {
+                if items.isEmpty {
+                    self.log("No APKs found.")
+                } else {
+                    self.log("Found \(items.count) APK(s).")
+                }
+                completion(items)
+            }
+        }.resume()
+    }
+
+    func installApk(from url: String) {
+        let trimmed = url.trimmingCharacters(in: .whitespacesAndNewlines)
+        log("Starting install from \(trimmed)...")
+
+        guard let downloadURL = URL(string: trimmed) else {
+            log("Invalid APK URL.")
+            return
+        }
+        guard let client else {
+            log("No device connected.")
+            return
+        }
+
+        URLSession.shared.downloadTask(with: downloadURL) { [weak self] tempURL, _, error in
+            guard let self else { return }
+            if let error {
+                DispatchQueue.main.async {
+                    self.log("Download failed: \(error.localizedDescription)")
+                }
+                return
+            }
+            guard let tempURL else {
+                DispatchQueue.main.async {
+                    self.log("Download failed: missing file.")
+                }
+                return
+            }
+
+            let targetURL = FileManager.default.temporaryDirectory.appendingPathComponent("beamio_payload.apk")
+            do {
+                if FileManager.default.fileExists(atPath: targetURL.path) {
+                    try FileManager.default.removeItem(at: targetURL)
+                }
+                try FileManager.default.moveItem(at: tempURL, to: targetURL)
+            } catch {
+                DispatchQueue.main.async {
+                    self.log("Failed to prepare APK: \(error.localizedDescription)")
+                }
+                return
+            }
+
+            self.workerQueue.async {
+                Task {
+                    do {
+                        try await client.installApk(at: targetURL) { [weak self] update in
+                            DispatchQueue.main.async {
+                                self?.log(update)
+                            }
+                        }
+                    } catch {
+                        DispatchQueue.main.async {
+                            self.log("Install failed: \(error.localizedDescription)")
+                        }
+                    }
+                }
+            }
+        }.resume()
+    }
+
+    private static func parseApkLinks(from html: String, baseURL: URL) -> [ApkItem] {
+        let pattern = "<a\\s+[^>]*href=[\"']([^\"']+\\.apk)[\"'][^>]*>(.*?)</a>"
+        let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive])
+        let nsRange = NSRange(html.startIndex..<html.endIndex, in: html)
+
+        var results: [ApkItem] = []
+        var seen = Set<String>()
+
+        if let regex {
+            for match in regex.matches(in: html, options: [], range: nsRange) {
+                guard let hrefRange = Range(match.range(at: 1), in: html) else { continue }
+                let href = String(html[hrefRange])
+                let name: String
+                if let textRange = Range(match.range(at: 2), in: html) {
+                    name = String(html[textRange]).trimmingCharacters(in: .whitespacesAndNewlines)
+                } else {
+                    name = ""
+                }
+
+                let fullURL = URL(string: href, relativeTo: baseURL)?.absoluteString ?? href
+                guard seen.insert(fullURL).inserted else { continue }
+
+                let displayName = name.isEmpty
+                    ? (URL(string: fullURL)?.lastPathComponent ?? "APK")
+                    : name
+                results.append(ApkItem(name: displayName, url: fullURL))
+            }
+        }
+
+        return results
+    }
+
+    private func log(_ message: String) {
+        let entry = "[\(timestamp())] \(message)"
+        if Thread.isMainThread {
+            logLines.append(entry)
+        } else {
+            DispatchQueue.main.async { [weak self] in
+                self?.logLines.append(entry)
+            }
+        }
+    }
+
+    private func timestamp() -> String {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "HH:mm:ss"
+        return formatter.string(from: Date())
+    }
+}
+
+private final class ADBClient {
+    private var connection: ADBConnection?
+    private var nextLocalId: UInt32 = 1
+    private var keyPair: ADBKeyPair?
+
+    func connect(host: String, port: UInt16, keyStoragePath: String) async throws {
+        guard !host.isEmpty else { throw ADBError.invalidHost }
+
+        let connection = ADBConnection(host: host, port: port)
+        try await connection.start()
+        self.connection = connection
+
+        let keyPair = try ADBKeyManager.loadOrCreateKeyPair(at: keyStoragePath)
+        self.keyPair = keyPair
+
+        try await sendPacket(.cnxn, arg0: 0x01000000, arg1: 4096, data: Data("host::".utf8))
+
+        var sentSignature = false
+        var sentPublicKey = false
+
+        while true {
+            let packet = try await readPacket()
+            switch packet.command {
+            case .cnxn:
+                return
+            case .auth:
+                guard let keyPair else { throw ADBError.authenticationFailed }
+                if !sentSignature, packet.arg0 == 1 {
+                    let signature = try ADBKeyManager.sign(token: packet.data, with: keyPair.privateKey)
+                    try await sendPacket(.auth, arg0: 2, arg1: 0, data: signature)
+                    sentSignature = true
+                } else if !sentPublicKey {
+                    let publicKeyData = Data((keyPair.publicKey + "\u{0}").utf8)
+                    try await sendPacket(.auth, arg0: 3, arg1: 0, data: publicKeyData)
+                    sentPublicKey = true
+                } else {
+                    throw ADBError.authenticationFailed
+                }
+            default:
+                continue
+            }
+        }
+    }
+
+    func installApk(at localURL: URL, progress: (String) -> Void) async throws {
+        progress("Uploading APK...")
+        try await pushFile(localURL: localURL, remotePath: "/data/local/tmp/beamio_payload.apk", mode: 0o644)
+
+        progress("Installing APK...")
+        let output = try await runShell("pm install -r /data/local/tmp/beamio_payload.apk")
+        progress(output.trimmingCharacters(in: .whitespacesAndNewlines))
+
+        _ = try? await runShell("rm /data/local/tmp/beamio_payload.apk")
+        progress("Install complete.")
+    }
+
+    private func runShell(_ command: String) async throws -> String {
+        let stream = try await openStream(service: "shell:\(command)")
+        let data = try await readStreamUntilClose(stream)
+        return String(data: data, encoding: .utf8) ?? ""
+    }
+
+    private func pushFile(localURL: URL, remotePath: String, mode: Int) async throws {
+        let stream = try await openStream(service: "sync:")
+        var buffer = Data()
+
+        func fillBuffer(minBytes: Int) async throws {
+            while buffer.count < minBytes {
+                let packet = try await readPacket()
+                switch packet.command {
+                case .wrte:
+                    guard packet.arg0 == stream.remoteId, packet.arg1 == stream.localId else { continue }
+                    buffer.append(packet.data)
+                    try await sendPacket(.okay, arg0: stream.localId, arg1: stream.remoteId, data: Data())
+                case .clse:
+                    try await sendPacket(.clse, arg0: stream.localId, arg1: stream.remoteId, data: Data())
+                    throw ADBError.streamClosed
+                default:
+                    continue
+                }
+            }
+        }
+
+        func readBytes(_ length: Int) async throws -> Data {
+            try await fillBuffer(minBytes: length)
+            let slice = buffer.prefix(length)
+            buffer.removeFirst(length)
+            return Data(slice)
+        }
+
+        let sendPath = "\(remotePath),\(String(format: "%o", mode))"
+        try await writeSyncCommand(stream: stream, id: "SEND", data: Data(sendPath.utf8), buffer: &buffer)
+
+        let handle = try FileHandle(forReadingFrom: localURL)
+        defer { try? handle.close() }
+
+        while true {
+            let chunk = try handle.read(upToCount: 64 * 1024) ?? Data()
+            if chunk.isEmpty { break }
+            try await writeSyncCommand(stream: stream, id: "DATA", data: chunk, buffer: &buffer)
+        }
+
+        let mtime = UInt32(Date().timeIntervalSince1970)
+        try await writeSyncDone(stream: stream, mtime: mtime, buffer: &buffer)
+
+        let responseId = try await readBytes(4)
+        let responseIdString = String(data: responseId, encoding: .ascii) ?? ""
+        let responseLengthData = try await readBytes(4)
+        let responseLength = responseLengthData.readUInt32LE(at: 0)
+
+        if responseIdString == "OKAY" {
+            _ = responseLength
+            return
+        }
+
+        if responseIdString == "FAIL" {
+            let messageData = try await readBytes(Int(responseLength))
+            let message = String(data: messageData, encoding: .utf8) ?? "Unknown error"
+            throw ADBError.syncFailed(message)
+        }
+
+        throw ADBError.invalidResponse
+    }
+
+    private func openStream(service: String) async throws -> ADBStream {
+        let localId = nextLocalId
+        nextLocalId += 1
+
+        var payload = Data(service.utf8)
+        payload.append(0)
+
+        try await sendPacket(.open, arg0: localId, arg1: 0, data: payload)
+
+        while true {
+            let packet = try await readPacket()
+            switch packet.command {
+            case .okay:
+                if packet.arg1 == localId {
+                    return ADBStream(localId: localId, remoteId: packet.arg0)
+                }
+            case .clse:
+                throw ADBError.streamClosed
+            default:
+                continue
+            }
+        }
+    }
+
+    private func readStreamUntilClose(_ stream: ADBStream) async throws -> Data {
+        var output = Data()
+
+        while true {
+            let packet = try await readPacket()
+            switch packet.command {
+            case .wrte:
+                guard packet.arg0 == stream.remoteId, packet.arg1 == stream.localId else { continue }
+                output.append(packet.data)
+                try await sendPacket(.okay, arg0: stream.localId, arg1: stream.remoteId, data: Data())
+            case .clse:
+                if packet.arg0 == stream.remoteId, packet.arg1 == stream.localId {
+                    try await sendPacket(.clse, arg0: stream.localId, arg1: stream.remoteId, data: Data())
+                    return output
+                }
+            default:
+                continue
+            }
+        }
+    }
+
+    private func writeSyncCommand(stream: ADBStream, id: String, data: Data, buffer: inout Data) async throws {
+        var payload = Data(id.utf8)
+        var length = UInt32(data.count).littleEndian
+        payload.append(Data(bytes: &length, count: 4))
+        payload.append(data)
+        try await sendPacket(.wrte, arg0: stream.localId, arg1: stream.remoteId, data: payload)
+        try await waitForOkay(stream: stream, buffer: &buffer)
+    }
+
+    private func writeSyncDone(stream: ADBStream, mtime: UInt32, buffer: inout Data) async throws {
+        var payload = Data("DONE".utf8)
+        var time = mtime.littleEndian
+        payload.append(Data(bytes: &time, count: 4))
+        try await sendPacket(.wrte, arg0: stream.localId, arg1: stream.remoteId, data: payload)
+        try await waitForOkay(stream: stream, buffer: &buffer)
+    }
+
+    private func waitForOkay(stream: ADBStream, buffer: inout Data) async throws {
+        while true {
+            let packet = try await readPacket()
+            switch packet.command {
+            case .okay:
+                if packet.arg0 == stream.remoteId, packet.arg1 == stream.localId {
+                    return
+                }
+            case .wrte:
+                guard packet.arg0 == stream.remoteId, packet.arg1 == stream.localId else { continue }
+                buffer.append(packet.data)
+                try await sendPacket(.okay, arg0: stream.localId, arg1: stream.remoteId, data: Data())
+            case .clse:
+                if packet.arg0 == stream.remoteId, packet.arg1 == stream.localId {
+                    throw ADBError.streamClosed
+                }
+            default:
+                continue
+            }
+        }
+    }
+
+    private func readPacket() async throws -> ADBPacket {
+        guard let connection else { throw ADBError.connectionClosed }
+        let header = try await connection.receiveExact(24)
+        if header.count < 24 { throw ADBError.connectionClosed }
+
+        let command = header.readUInt32LE(at: 0)
+        let arg0 = header.readUInt32LE(at: 4)
+        let arg1 = header.readUInt32LE(at: 8)
+        let length = header.readUInt32LE(at: 12)
+        let checksum = header.readUInt32LE(at: 16)
+        let magic = header.readUInt32LE(at: 20)
+
+        if command ^ 0xFFFFFFFF != magic {
+            throw ADBError.protocolError("Invalid magic")
+        }
+
+        let data = length > 0 ? try await connection.receiveExact(Int(length)) : Data()
+        _ = checksum
+        return ADBPacket(command: command, arg0: arg0, arg1: arg1, length: length, checksum: checksum, magic: magic, data: data)
+    }
+
+    private func sendPacket(_ command: ADBCommand, arg0: UInt32, arg1: UInt32, data: Data) async throws {
+        guard let connection else { throw ADBError.connectionClosed }
+
+        let checksum = data.reduce(UInt32(0)) { $0 + UInt32($1) }
+        let magic = command.rawValue ^ 0xFFFFFFFF
+
+        var payload = Data()
+        payload.appendUInt32LE(command.rawValue)
+        payload.appendUInt32LE(arg0)
+        payload.appendUInt32LE(arg1)
+        payload.appendUInt32LE(UInt32(data.count))
+        payload.appendUInt32LE(checksum)
+        payload.appendUInt32LE(magic)
+        payload.append(data)
+
+        try await connection.send(payload)
+    }
+}
+
+private struct ADBStream {
+    let localId: UInt32
+    let remoteId: UInt32
+}
+
+private enum ADBCommand: UInt32 {
+    case cnxn = 0x4e584e43
+    case auth = 0x48545541
+    case open = 0x4e45504f
+    case okay = 0x59414b4f
+    case clse = 0x45534c43
+    case wrte = 0x45545257
+}
+
+private struct ADBPacket {
+    let command: UInt32
+    let arg0: UInt32
+    let arg1: UInt32
+    let length: UInt32
+    let checksum: UInt32
+    let magic: UInt32
+    let data: Data
+}
+
+private final class ADBConnection {
+    private let connection: NWConnection
+    private let queue = DispatchQueue(label: "com.beamio.adb.connection")
+
+    init(host: String, port: UInt16) {
+        let endpoint = NWEndpoint.Host(host)
+        let port = NWEndpoint.Port(rawValue: port) ?? 5555
+        self.connection = NWConnection(host: endpoint, port: port, using: .tcp)
+    }
+
+    func start() async throws {
+        try await withCheckedThrowingContinuation { continuation in
+            var didResume = false
+            connection.stateUpdateHandler = { state in
+                guard !didResume else { return }
+                switch state {
+                case .ready:
+                    didResume = true
+                    continuation.resume()
+                case .failed(let error):
+                    didResume = true
+                    continuation.resume(throwing: error)
+                default:
+                    break
+                }
+            }
+            connection.start(queue: queue)
+        }
+    }
+
+    func send(_ data: Data) async throws {
+        try await withCheckedThrowingContinuation { continuation in
+            connection.send(content: data, completion: .contentProcessed { error in
+                if let error {
+                    continuation.resume(throwing: error)
+                } else {
+                    continuation.resume()
+                }
+            })
+        }
+    }
+
+    func receiveExact(_ length: Int) async throws -> Data {
+        var data = Data()
+        var remaining = length
+        while remaining > 0 {
+            let chunk = try await receive(minimum: 1, maximum: remaining)
+            if chunk.isEmpty {
+                throw ADBError.connectionClosed
+            }
+            data.append(chunk)
+            remaining -= chunk.count
+        }
+        return data
+    }
+
+    private func receive(minimum: Int, maximum: Int) async throws -> Data {
+        try await withCheckedThrowingContinuation { continuation in
+            connection.receive(minimumIncompleteLength: minimum, maximumLength: maximum) { content, _, isComplete, error in
+                if let error {
+                    continuation.resume(throwing: error)
+                    return
+                }
+                if isComplete && (content == nil || content?.isEmpty == true) {
+                    continuation.resume(throwing: ADBError.connectionClosed)
+                    return
+                }
+                continuation.resume(returning: content ?? Data())
+            }
+        }
+    }
+}
+
+private struct ADBKeyPair {
+    let privateKey: SecKey
+    let publicKey: String
+}
+
+private enum ADBKeyManager {
+    static func loadOrCreateKeyPair(at path: String) throws -> ADBKeyPair {
+        let keyURL = resolveKeyURL(path: path)
+        let pubURL = keyURL.appendingPathExtension("pub")
+
+        if FileManager.default.fileExists(atPath: keyURL.path),
+           let data = try? Data(contentsOf: keyURL),
+           let privateKey = createPrivateKey(from: data) {
+            let publicKey = (try? String(contentsOf: pubURL, encoding: .utf8)) ?? createPublicKeyString(from: privateKey)
+            return ADBKeyPair(privateKey: privateKey, publicKey: publicKey)
+        }
+
+        let attributes: [String: Any] = [
+            kSecAttrKeyType as String: kSecAttrKeyTypeRSA,
+            kSecAttrKeySizeInBits as String: 2048,
+        ]
+
+        var error: Unmanaged<CFError>?
+        guard let privateKey = SecKeyCreateRandomKey(attributes as CFDictionary, &error) else {
+            let message = error?.takeRetainedValue().localizedDescription ?? "Unknown error"
+            throw ADBError.keyGenerationFailed(message)
+        }
+
+        guard let privateData = SecKeyCopyExternalRepresentation(privateKey, &error) as Data? else {
+            let message = error?.takeRetainedValue().localizedDescription ?? "Unknown error"
+            throw ADBError.keyGenerationFailed(message)
+        }
+
+        try FileManager.default.createDirectory(at: keyURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try privateData.write(to: keyURL)
+
+        let publicKeyString = createPublicKeyString(from: privateKey)
+        try publicKeyString.write(to: pubURL, atomically: true, encoding: .utf8)
+
+        return ADBKeyPair(privateKey: privateKey, publicKey: publicKeyString)
+    }
+
+    static func sign(token: Data, with privateKey: SecKey) throws -> Data {
+        let algorithm: SecKeyAlgorithm = .rsaSignatureMessagePKCS1v15SHA1
+        guard SecKeyIsAlgorithmSupported(privateKey, .sign, algorithm) else {
+            throw ADBError.authenticationFailed
+        }
+        var error: Unmanaged<CFError>?
+        guard let signature = SecKeyCreateSignature(privateKey, algorithm, token as CFData, &error) as Data? else {
+            let message = error?.takeRetainedValue().localizedDescription ?? "Unknown error"
+            throw ADBError.keyGenerationFailed(message)
+        }
+        return signature
+    }
+
+    private static func resolveKeyURL(path: String) -> URL {
+        let url = URL(fileURLWithPath: path)
+        var isDirectory: ObjCBool = false
+        if FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory), isDirectory.boolValue {
+            return url.appendingPathComponent("adbkey")
+        }
+        if url.pathExtension.isEmpty {
+            return url.appendingPathComponent("adbkey")
+        }
+        return url
+    }
+
+    private static func createPrivateKey(from data: Data) -> SecKey? {
+        let attributes: [String: Any] = [
+            kSecAttrKeyType as String: kSecAttrKeyTypeRSA,
+            kSecAttrKeyClass as String: kSecAttrKeyClassPrivate,
+            kSecAttrKeySizeInBits as String: 2048,
+        ]
+
+        return SecKeyCreateWithData(data as CFData, attributes as CFDictionary, nil)
+    }
+
+    private static func createPublicKeyString(from privateKey: SecKey) -> String {
+        guard let publicKey = SecKeyCopyPublicKey(privateKey) else { return "" }
+        var error: Unmanaged<CFError>?
+        guard let publicData = SecKeyCopyExternalRepresentation(publicKey, &error) as Data? else { return "" }
+
+        guard let (modulus, exponent) = parseRSAPublicKey(publicData) else { return "" }
+
+        let sshKey = buildSSHPublicKey(modulus: modulus, exponent: exponent)
+        let base64Key = sshKey.base64EncodedString()
+        return "ssh-rsa \(base64Key) beamio@ios"
+    }
+
+    private static func parseRSAPublicKey(_ data: Data) -> (Data, Data)? {
+        if let pkcs1 = parseRSAPublicKeyPKCS1(data) {
+            return pkcs1
+        }
+        if let embedded = extractPKCS1(fromSubjectPublicKeyInfo: data) {
+            return parseRSAPublicKeyPKCS1(embedded)
+        }
+        return nil
+    }
+
+    private static func parseRSAPublicKeyPKCS1(_ data: Data) -> (Data, Data)? {
+        var index = 0
+
+        func readByte() -> UInt8? {
+            guard index < data.count else { return nil }
+            let byte = data[index]
+            index += 1
+            return byte
+        }
+
+        func readLength() -> Int? {
+            guard let first = readByte() else { return nil }
+            if first & 0x80 == 0 {
+                return Int(first)
+            }
+            let byteCount = Int(first & 0x7F)
+            var length = 0
+            for _ in 0..<byteCount {
+                guard let next = readByte() else { return nil }
+                length = (length << 8) | Int(next)
+            }
+            return length
+        }
+
+        guard readByte() == 0x30, let _ = readLength() else { return nil }
+        guard readByte() == 0x02, let modLen = readLength() else { return nil }
+        guard index + modLen <= data.count else { return nil }
+        let modulus = Data(data[index..<index + modLen])
+        index += modLen
+
+        guard readByte() == 0x02, let expLen = readLength() else { return nil }
+        guard index + expLen <= data.count else { return nil }
+        let exponent = Data(data[index..<index + expLen])
+
+        return (modulus, exponent)
+    }
+
+    private static func extractPKCS1(fromSubjectPublicKeyInfo data: Data) -> Data? {
+        var index = 0
+
+        func readByte() -> UInt8? {
+            guard index < data.count else { return nil }
+            let byte = data[index]
+            index += 1
+            return byte
+        }
+
+        func readLength() -> Int? {
+            guard let first = readByte() else { return nil }
+            if first & 0x80 == 0 {
+                return Int(first)
+            }
+            let byteCount = Int(first & 0x7F)
+            var length = 0
+            for _ in 0..<byteCount {
+                guard let next = readByte() else { return nil }
+                length = (length << 8) | Int(next)
+            }
+            return length
+        }
+
+        guard readByte() == 0x30, let _ = readLength() else { return nil }
+        guard readByte() == 0x30, let algLen = readLength() else { return nil }
+        index += algLen
+        guard readByte() == 0x03, let bitLen = readLength() else { return nil }
+        guard index < data.count else { return nil }
+        _ = readByte() // unused bits
+        let remaining = bitLen - 1
+        guard remaining > 0, index + remaining <= data.count else { return nil }
+        return Data(data[index..<index + remaining])
+    }
+
+    private static func buildSSHPublicKey(modulus: Data, exponent: Data) -> Data {
+        func sshString(_ string: String) -> Data {
+            let data = Data(string.utf8)
+            return sshData(data)
+        }
+
+        func sshData(_ data: Data) -> Data {
+            var length = UInt32(data.count).bigEndian
+            var result = Data(bytes: &length, count: 4)
+            result.append(data)
+            return result
+        }
+
+        func mpint(_ data: Data) -> Data {
+            var bytes = Data(data)
+            while bytes.first == 0x00 && bytes.count > 1 {
+                bytes.removeFirst()
+            }
+            if let first = bytes.first, first & 0x80 != 0 {
+                bytes.insert(0x00, at: 0)
+            }
+            return bytes
+        }
+
+        var key = Data()
+        key.append(sshString("ssh-rsa"))
+        key.append(sshData(mpint(exponent)))
+        key.append(sshData(mpint(modulus)))
+        return key
+    }
+}
+
+private extension Data {
+    func readUInt32LE(at offset: Int) -> UInt32 {
+        guard offset + 3 < count else { return 0 }
+        let b0 = UInt32(self[offset])
+        let b1 = UInt32(self[offset + 1]) << 8
+        let b2 = UInt32(self[offset + 2]) << 16
+        let b3 = UInt32(self[offset + 3]) << 24
+        return b0 | b1 | b2 | b3
+    }
+
+    mutating func appendUInt32LE(_ value: UInt32) {
+        var value = value.littleEndian
+        append(Data(bytes: &value, count: 4))
+    }
+}
