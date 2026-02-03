@@ -48,7 +48,7 @@ final class PythonManager: ObservableObject {
     private func pythonLibraryPath() -> String? {
         let candidates = [
             Bundle.main.privateFrameworksPath,
-            Bundle.main.frameworksPath
+            Bundle.main.sharedFrameworksPath
         ]
         .compactMap { $0 }
         .map { "\($0)/Python.framework/Python" }
