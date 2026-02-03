@@ -72,7 +72,12 @@ final class PythonManager: ObservableObject {
             guard let self else { return }
             let resultObject = worker?.connect(ipAddress, keyStoragePath)
             let result = resultObject.flatMap { String($0) } ?? "Connection failed"
-            let errorMessage = worker?.last_error().flatMap { String($0) } ?? ""
+            let errorMessage: String
+            if let errorObject = worker?.last_error() {
+                errorMessage = String(describing: errorObject)
+            } else {
+                errorMessage = ""
+            }
 
             DispatchQueue.main.async {
                 self.connectionStatus = result
@@ -100,7 +105,12 @@ final class PythonManager: ObservableObject {
                     items.append(ApkItem(name: name, url: link))
                 }
             }
-            let errorMessage = worker?.last_error().flatMap { String($0) } ?? ""
+            let errorMessage: String
+            if let errorObject = worker?.last_error() {
+                errorMessage = String(describing: errorObject)
+            } else {
+                errorMessage = ""
+            }
 
             DispatchQueue.main.async {
                 if items.isEmpty {
