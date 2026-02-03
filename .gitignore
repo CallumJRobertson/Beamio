@@ -1,0 +1,5 @@
+*.xcframework
+**/site-packages
+build/
+*.ipa
+*.app
