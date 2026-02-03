@@ -72,10 +72,14 @@ final class PythonManager: ObservableObject {
             guard let self else { return }
             let resultObject = worker?.connect(ipAddress, keyStoragePath)
             let result = resultObject.flatMap { String($0) } ?? "Connection failed"
+            let errorMessage = worker?.last_error().flatMap { String($0) } ?? ""
 
             DispatchQueue.main.async {
                 self.connectionStatus = result
                 self.log(result)
+                if !errorMessage.isEmpty {
+                    self.log("Python error: \(errorMessage)")
+                }
                 completion?(result)
             }
         }
@@ -96,12 +100,16 @@ final class PythonManager: ObservableObject {
                     items.append(ApkItem(name: name, url: link))
                 }
             }
+            let errorMessage = worker?.last_error().flatMap { String($0) } ?? ""
 
             DispatchQueue.main.async {
                 if items.isEmpty {
                     self.log("No APKs found.")
                 } else {
                     self.log("Found \(items.count) APK(s).")
+                }
+                if !errorMessage.isEmpty {
+                    self.log("Python error: \(errorMessage)")
                 }
                 completion(items)
             }
