@@ -66,7 +66,9 @@ final class ADBManager: ObservableObject {
 
         workerQueue.async { [weak self] in
             guard let self else { return }
-            let client = ADBClient()
+            let client = ADBClient { [weak self] message in
+                self?.log(message)
+            }
             Task {
                 let result: String
                 do {
@@ -77,6 +79,7 @@ final class ADBManager: ObservableObject {
                     self.client = nil
                     result = "Connection failed"
                     self.log("\(result): \(error.localizedDescription)")
+                    self.log("Error: \(String(reflecting: error))")
                 }
 
                 DispatchQueue.main.async {
@@ -174,6 +177,7 @@ final class ADBManager: ObservableObject {
                     } catch {
                         DispatchQueue.main.async {
                             self.log("Install failed: \(error.localizedDescription)")
+                            self.log("Error: \(String(reflecting: error))")
                         }
                     }
                 }
@@ -257,14 +261,19 @@ final class ADBManager: ObservableObject {
 }
 
 private final class ADBClient {
+    private let logger: ((String) -> Void)?
     private var connection: ADBConnection?
     private var nextLocalId: UInt32 = 1
     private var keyPair: ADBKeyPair?
 
+    init(logger: ((String) -> Void)? = nil) {
+        self.logger = logger
+    }
+
     func connect(host: String, port: UInt16, keyStoragePath: String) async throws {
         guard !host.isEmpty else { throw ADBError.invalidHost }
 
-        let connection = ADBConnection(host: host, port: port)
+        let connection = ADBConnection(host: host, port: port, logger: logger)
         try await connection.start()
         self.connection = connection
 
@@ -505,6 +514,7 @@ private final class ADBClient {
 
         let data = length > 0 ? try await connection.receiveExact(Int(length)) : Data()
         _ = checksum
+        tracePacket(direction: "RX", command: command, arg0: arg0, arg1: arg1, length: length, checksum: checksum, data: data)
         return ADBPacket(command: command, arg0: arg0, arg1: arg1, length: length, checksum: checksum, magic: magic, data: data)
     }
 
@@ -523,7 +533,17 @@ private final class ADBClient {
         payload.appendUInt32LE(magic)
         payload.append(data)
 
+        tracePacket(direction: "TX", command: command, arg0: arg0, arg1: arg1, length: UInt32(data.count), checksum: checksum, data: data)
         try await connection.send(payload)
+    }
+
+    private func trace(_ message: String) {
+        logger?("[ADB] \(message)")
+    }
+
+    private func tracePacket(direction: String, command: ADBCommand, arg0: UInt32, arg1: UInt32, length: UInt32, checksum: UInt32, data: Data) {
+        let payloadPreview = data.hexPreview(maxBytes: 256)
+        trace("\(direction) \(command.name) arg0=\(arg0) arg1=\(arg1) len=\(length) checksum=\(checksum) data=\(payloadPreview)")
     }
 }
 
@@ -539,6 +559,17 @@ private enum ADBCommand: UInt32 {
     case okay = 0x59414b4f
     case clse = 0x45534c43
     case wrte = 0x45545257
+
+    var name: String {
+        switch self {
+        case .cnxn: return "CNXN"
+        case .auth: return "AUTH"
+        case .open: return "OPEN"
+        case .okay: return "OKAY"
+        case .clse: return "CLSE"
+        case .wrte: return "WRTE"
+        }
+    }
 }
 
 private struct ADBPacket {
@@ -554,11 +585,13 @@ private struct ADBPacket {
 private final class ADBConnection {
     private let connection: NWConnection
     private let queue = DispatchQueue(label: "com.beamio.adb.connection")
+    private let logger: ((String) -> Void)?
 
-    init(host: String, port: UInt16) {
+    init(host: String, port: UInt16, logger: ((String) -> Void)? = nil) {
         let endpoint = NWEndpoint.Host(host)
         let port = NWEndpoint.Port(rawValue: port) ?? 5555
         self.connection = NWConnection(host: endpoint, port: port, using: .tcp)
+        self.logger = logger
     }
 
     func start(timeout: TimeInterval = 8) async throws {
@@ -582,16 +615,20 @@ private final class ADBConnection {
                 case .ready:
                     didResume = true
                     timer.cancel()
+                    self.logger?("[ADB] Connection ready")
                     continuation.resume()
                 case .failed(let error):
                     didResume = true
                     timer.cancel()
+                    self.logger?("[ADB] Connection failed: \(error.localizedDescription)")
                     continuation.resume(throwing: error)
                 case .waiting(let error):
                     lastError = error
+                    self.logger?("[ADB] Connection waiting: \(error.localizedDescription)")
                 case .cancelled:
                     didResume = true
                     timer.cancel()
+                    self.logger?("[ADB] Connection cancelled")
                     continuation.resume(throwing: ADBError.connectionClosed)
                 default:
                     break
@@ -860,5 +897,27 @@ private extension Data {
     mutating func appendUInt32LE(_ value: UInt32) {
         var value = value.littleEndian
         append(Data(bytes: &value, count: 4))
+    }
+
+    func hexPreview(maxBytes: Int) -> String {
+        guard !isEmpty else { return "<empty>" }
+        let length = count
+        if length <= maxBytes {
+            return hexString()
+        }
+        let headCount = maxBytes / 2
+        let tailCount = maxBytes - headCount
+        let head = self.prefix(headCount)
+        let tail = self.suffix(tailCount)
+        return "\(head.hexString())…\(tail.hexString()) (truncated \(maxBytes)/\(length))"
+    }
+
+    func hexString() -> String {
+        var output = ""
+        output.reserveCapacity(count * 2)
+        for byte in self {
+            output.append(String(format: "%02x", byte))
+        }
+        return output
     }
 }
