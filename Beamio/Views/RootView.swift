@@ -1,10 +1,10 @@
 import SwiftUI
 
 struct RootView: View {
-    @AppStorage("hasOnboarded") private var hasOnboarded: Bool = false
+    @ObservedObject private var settings = AppSettings.shared
 
     var body: some View {
-        if hasOnboarded {
+        if settings.hasOnboarded {
             ContentView()
         } else {
             OnboardingView()

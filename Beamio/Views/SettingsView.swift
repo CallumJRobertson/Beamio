@@ -2,10 +2,7 @@ import SwiftUI
 
 struct SettingsView: View {
     @EnvironmentObject private var adbManager: ADBManager
-    @AppStorage("fireTVIP") private var fireTVIP: String = ""
-    @AppStorage("updateURL") private var updateURL: String = ""
-    @AppStorage("hasOnboarded") private var hasOnboarded: Bool = false
-    @AppStorage("autoConnectOnLaunch") private var autoConnectOnLaunch: Bool = false
+    @ObservedObject private var settings = AppSettings.shared
 
     @State private var showClearCacheAlert = false
     @State private var showResetAlert = false
@@ -137,30 +134,7 @@ struct SettingsView: View {
         BeamioSection("Connection") {
             BeamioCard {
                 VStack(alignment: .leading, spacing: 16) {
-                    VStack(alignment: .leading, spacing: 8) {
-                        Label("Device Address", systemImage: "network")
-                            .font(BeamioTheme.subtitleFont(14))
-
-                        TextField("192.168.0.21:5555", text: $fireTVIP)
-                            .keyboardType(.numbersAndPunctuation)
-                            .textInputAutocapitalization(.never)
-                            .autocorrectionDisabled()
-                            .beamioTextField()
-
-                        HStack {
-                            Image(systemName: BeamioValidator.isValidIP(fireTVIP) ? "checkmark.circle.fill" : "exclamationmark.circle.fill")
-                                .foregroundColor(BeamioValidator.isValidIP(fireTVIP) ? BeamioTheme.success : BeamioTheme.warning)
-                                .font(.system(size: 12))
-
-                            Text(BeamioValidator.isValidIP(fireTVIP) ? "Valid address format" : "Enter IPv4 address with optional :port")
-                                .font(BeamioTheme.captionFont(12))
-                                .foregroundColor(.secondary)
-                        }
-                    }
-
-                    BeamioDivider()
-
-                    Toggle(isOn: $autoConnectOnLaunch) {
+                    Toggle(isOn: $settings.autoConnectOnLaunch) {
                         HStack(spacing: 10) {
                             Image(systemName: "bolt.fill")
                                 .foregroundColor(BeamioTheme.warning)
@@ -261,7 +235,7 @@ struct SettingsView: View {
                     Label("APK Feed URL", systemImage: "link")
                         .font(BeamioTheme.subtitleFont(14))
 
-                    TextField("https://example.com/downloads", text: $updateURL)
+                    TextField("https://example.com/downloads", text: $settings.updateURL)
                         .keyboardType(.URL)
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
@@ -298,7 +272,7 @@ struct SettingsView: View {
                     BeamioDivider()
 
                     Button {
-                        hasOnboarded = false
+                        settings.hasOnboarded = false
                     } label: {
                         HStack {
                             Image(systemName: "arrow.counterclockwise")
@@ -408,10 +382,7 @@ struct SettingsView: View {
         defaults.removePersistentDomain(forName: domain)
         defaults.synchronize()
 
-        fireTVIP = ""
-        updateURL = ""
-        hasOnboarded = false
-        autoConnectOnLaunch = false
+        settings.reset()
     }
 }
 

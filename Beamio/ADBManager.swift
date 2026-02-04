@@ -267,7 +267,7 @@ final class ADBManager: ObservableObject {
         updateConnectionState(.reconnecting)
         log("Connection lost, attempting reconnect (\(reconnectAttempts)/\(maxReconnectAttempts))...")
 
-        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
             guard let self else { return }
             self.connect(ipAddress: self.lastConnectedIP, keyStoragePath: self.lastKeyStoragePath) { result in
                 if result == "Connected" {
@@ -492,10 +492,7 @@ final class ADBManager: ObservableObject {
                         self.isRefreshing = false
                         self.appsError = nil
                         self.log("Loaded \(fetched.count) apps.")
-                        // Add a small delay before loading icons to let the UI settle
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-                            self.preloadVisibleIcons()
-                        }
+                        self.preloadVisibleIcons()
                     }
                 } catch {
                     DispatchQueue.main.async {
@@ -518,14 +515,11 @@ final class ADBManager: ObservableObject {
         totalIconsToLoad = appsNeedingIcons.count
         iconLoadingCount = 0
 
-        // Load icons one at a time with delays to prevent stream conflicts
-        let batchSize = 3
+        // Load icons in parallel - the operation queue will serialize ADB operations
+        let batchSize = 6
         let batch = Array(appsNeedingIcons.prefix(batchSize))
-        for (index, app) in batch.enumerated() {
-            // Stagger icon loads to prevent overwhelming the ADB connection
-            DispatchQueue.main.asyncAfter(deadline: .now() + Double(index) * 0.5) { [weak self] in
-                self?.loadIcon(for: app)
-            }
+        for app in batch {
+            loadIcon(for: app)
         }
     }
 
@@ -1008,8 +1002,6 @@ private final class ADBClient {
         var apps: [AppInfo] = []
 
         for package in targetPackages.sorted() {
-            // Add a small delay between package detail fetches to prevent stream conflicts
-            try? await Task.sleep(nanoseconds: 50_000_000) // 50ms
             let details = try? await fetchPackageDetails(package)
             let apkPath = packagePaths[package] ?? details?.codePath
             let installer = installers[package] ?? details?.installer
@@ -1089,14 +1081,9 @@ private final class ADBClient {
         return String(data: data, encoding: .utf8) ?? ""
     }
 
-    private func runShellOptional(_ command: String, delay: UInt64 = 100_000_000) async -> String {
+    private func runShellOptional(_ command: String) async -> String {
         do {
-            let result = try await runShell(command)
-            // Small delay to let the ADB connection settle between commands
-            if delay > 0 {
-                try? await Task.sleep(nanoseconds: delay)
-            }
-            return result
+            return try await runShell(command)
         } catch {
             trace("Shell command failed (\(command)): \(error.localizedDescription)")
             return ""
@@ -1589,10 +1576,12 @@ private final class ADBClient {
     }
 
     private func tracePacket(direction: String, command: ADBCommand, arg0: UInt32, arg1: UInt32, length: UInt32, checksum: UInt32, data: Data) {
+        // Heavily throttle packet logging to reduce noise
         if command == .okay {
             okayPacketCount += 1
-            if okayPacketCount <= 5 || okayPacketCount % 50 == 0 {
-                trace("\(direction) \(command.name) arg0=\(arg0) arg1=\(arg1) len=\(length)")
+            // Only log first packet and then every 500th
+            if okayPacketCount == 1 {
+                trace("\(direction) \(command.name) (subsequent OKAY packets suppressed)")
             }
             return
         }
@@ -1600,18 +1589,24 @@ private final class ADBClient {
         if command == .wrte, let syncId = syncCommandId(from: data) {
             if syncId == "DATA" {
                 dataPacketCount += 1
-                if dataPacketCount <= 3 || dataPacketCount % 100 == 0 {
-                    trace("\(direction) \(command.name) id=DATA chunk=\(dataPacketCount) bytes=\(data.count)")
+                // Only log first DATA packet
+                if dataPacketCount == 1 {
+                    trace("\(direction) \(command.name) id=DATA (subsequent DATA packets suppressed)")
                 }
                 return
             }
-            let payloadPreview = data.hexPreview(maxBytes: 64)
-            trace("\(direction) \(command.name) id=\(syncId) arg0=\(arg0) arg1=\(arg1) len=\(length) checksum=\(checksum) data=\(payloadPreview)")
+            // Suppress other sync commands except SEND/RECV/DONE/FAIL
+            if syncId != "SEND" && syncId != "RECV" && syncId != "DONE" && syncId != "FAIL" {
+                return
+            }
+            trace("\(direction) \(command.name) id=\(syncId) len=\(length)")
             return
         }
 
-        let payloadPreview = data.hexPreview(maxBytes: 64)
-        trace("\(direction) \(command.name) arg0=\(arg0) arg1=\(arg1) len=\(length) checksum=\(checksum) data=\(payloadPreview)")
+        // Only log important commands
+        if command == .open || command == .clse {
+            trace("\(direction) \(command.name) arg0=\(arg0) arg1=\(arg1)")
+        }
     }
 
     private func syncCommandId(from data: Data) -> String? {

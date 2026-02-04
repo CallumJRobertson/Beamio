@@ -3,8 +3,7 @@ import UniformTypeIdentifiers
 
 struct InstallView: View {
     @EnvironmentObject private var adbManager: ADBManager
-    @AppStorage("updateURL") private var updateURL: String = ""
-    @AppStorage("directApkURL") private var directApkURL: String = ""
+    @ObservedObject private var settings = AppSettings.shared
 
     @State private var apkItems: [ApkItem] = []
     @State private var selectedApk: ApkItem?
@@ -82,7 +81,7 @@ struct InstallView: View {
                     Label("APK URL", systemImage: "link")
                         .font(BeamioTheme.subtitleFont(15))
 
-                    TextField("https://example.com/app.apk", text: $directApkURL)
+                    TextField("https://example.com/app.apk", text: $settings.directApkURL)
                         .keyboardType(.URL)
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
@@ -93,7 +92,7 @@ struct InstallView: View {
                         .foregroundColor(.secondary)
 
                     Button {
-                        let trimmed = directApkURL.trimmingCharacters(in: .whitespacesAndNewlines)
+                        let trimmed = settings.directApkURL.trimmingCharacters(in: .whitespacesAndNewlines)
                         guard !trimmed.isEmpty else { return }
                         adbManager.installApk(from: trimmed)
                     } label: {
@@ -104,7 +103,7 @@ struct InstallView: View {
                         .frame(maxWidth: .infinity)
                     }
                     .buttonStyle(PrimaryButtonStyle())
-                    .disabled(directApkURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || adbManager.isInstalling)
+                    .disabled(settings.directApkURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || adbManager.isInstalling)
                 }
             }
         }
@@ -172,7 +171,7 @@ struct InstallView: View {
                     Label("Find APKs", systemImage: "magnifyingglass")
                         .font(BeamioTheme.subtitleFont(15))
 
-                    TextField("https://example.com/downloads", text: $updateURL)
+                    TextField("https://example.com/downloads", text: $settings.updateURL)
                         .keyboardType(.URL)
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
@@ -198,7 +197,7 @@ struct InstallView: View {
                         .frame(maxWidth: .infinity)
                     }
                     .buttonStyle(SecondaryButtonStyle())
-                    .disabled(updateURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || isScanning)
+                    .disabled(settings.updateURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || isScanning)
 
                     if !apkItems.isEmpty {
                         BeamioDivider()
@@ -280,7 +279,7 @@ struct InstallView: View {
         apkItems = []
         selectedApk = nil
 
-        adbManager.scanURL(updateURL) { items in
+        adbManager.scanURL(settings.updateURL) { items in
             apkItems = items
             selectedApk = items.first(where: { $0.isPreferred }) ?? items.first
             isScanning = false

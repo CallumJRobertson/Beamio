@@ -2,13 +2,23 @@ import SwiftUI
 
 struct LogView: View {
     @EnvironmentObject private var adbManager: ADBManager
+    @ObservedObject private var settings = AppSettings.shared
     @State private var searchText = ""
     @State private var showCopyConfirmation = false
 
     private var filteredLogs: [String] {
+        var logs = adbManager.logLines
+
+        // Filter out technical ADB protocol messages
+        if settings.hideADBLogs {
+            logs = logs.filter { line in
+                !line.contains("[ADB]")
+            }
+        }
+
         let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !query.isEmpty else { return adbManager.logLines }
-        return adbManager.logLines.filter { $0.localizedCaseInsensitiveContains(query) }
+        guard !query.isEmpty else { return logs }
+        return logs.filter { $0.localizedCaseInsensitiveContains(query) }
     }
 
     var body: some View {
@@ -51,6 +61,12 @@ struct LogView: View {
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
                     Menu {
+                        Toggle(isOn: $settings.hideADBLogs) {
+                            Label("Hide Technical Logs", systemImage: "eye.slash")
+                        }
+
+                        Divider()
+
                         Button {
                             copyLogs()
                         } label: {
