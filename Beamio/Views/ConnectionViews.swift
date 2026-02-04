@@ -1,5 +1,27 @@
 import SwiftUI
 
+// MARK: - ADB Key Storage Helper
+
+/// Provides a consistent path for ADB key storage across the app
+enum ADBKeyStorage {
+    /// Returns a consistent path for storing the ADB key pair
+    static func path() -> String {
+        let fileManager = FileManager.default
+        guard let appSupport = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask).first else {
+            // Fallback to documents directory which is always available
+            let docs = fileManager.urls(for: .documentDirectory, in: .userDomainMask).first!
+            let keyDir = docs.appendingPathComponent("ADBKeys", isDirectory: true)
+            try? fileManager.createDirectory(at: keyDir, withIntermediateDirectories: true)
+            return keyDir.path
+        }
+
+        // Create a dedicated subdirectory for ADB keys
+        let keyDir = appSupport.appendingPathComponent("ADBKeys", isDirectory: true)
+        try? fileManager.createDirectory(at: keyDir, withIntermediateDirectories: true)
+        return keyDir.path
+    }
+}
+
 struct ConnectionPanel: View {
     @EnvironmentObject private var adbManager: ADBManager
     @AppStorage("fireTVIP") private var fireTVIP: String = ""
@@ -136,8 +158,7 @@ struct ConnectionPanel: View {
     }
 
     private func performConnect() {
-        let keyPath = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
-        let storagePath = keyPath?.path ?? NSTemporaryDirectory()
+        let storagePath = ADBKeyStorage.path()
         adbManager.connect(ipAddress: fireTVIP, keyStoragePath: storagePath)
     }
 
@@ -165,8 +186,7 @@ struct CompactConnectionPanel: View {
 
     var body: some View {
         Button {
-            let keyPath = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
-            let storagePath = keyPath?.path ?? NSTemporaryDirectory()
+            let storagePath = ADBKeyStorage.path()
             adbManager.connect(ipAddress: fireTVIP, keyStoragePath: storagePath)
         } label: {
             HStack(spacing: 6) {
