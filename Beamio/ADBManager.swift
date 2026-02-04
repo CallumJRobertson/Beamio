@@ -147,6 +147,14 @@ final class ADBManager: ObservableObject {
     private var cachedKeyPair: ADBKeyPair?
     private var wasConnectedBeforeBackground: Bool = false
 
+    // Connection state lock to prevent multiple simultaneous connections
+    private var isConnecting: Bool = false
+    private let connectionLock = NSLock()
+
+    // Icon loading serialization
+    private var iconLoadQueue: [AppInfo] = []
+    private var isLoadingIconSequentially: Bool = false
+
     private init() {
         loadUpdateSources()
         loadSettings()
@@ -218,12 +226,27 @@ final class ADBManager: ObservableObject {
     }
 
     func connect(ipAddress: String, keyStoragePath: String, completion: ((String) -> Void)? = nil) {
+        // Prevent multiple simultaneous connection attempts
+        connectionLock.lock()
+        if isConnecting {
+            connectionLock.unlock()
+            log("Connection already in progress, skipping...")
+            return
+        }
+        isConnecting = true
+        connectionLock.unlock()
+
+        // Disconnect existing client first
+        if client != nil {
+            stopKeepAlive()
+            client = nil
+        }
+
         let targetIP = ipAddress.trimmingCharacters(in: .whitespacesAndNewlines)
         let (host, port) = Self.parseHostPort(from: targetIP)
 
         lastConnectedIP = targetIP
         lastKeyStoragePath = keyStoragePath
-        reconnectAttempts = 0
 
         updateConnectionState(.connecting)
         log("Connecting to \(host):\(port)...")
@@ -240,6 +263,9 @@ final class ADBManager: ObservableObject {
                     keyPair = try ADBKeyManager.loadOrCreateKeyPair(at: keyStoragePath)
                     self.cachedKeyPair = keyPair
                 } catch {
+                    self.connectionLock.lock()
+                    self.isConnecting = false
+                    self.connectionLock.unlock()
                     DispatchQueue.main.async {
                         self.updateConnectionState(.failed("Key generation failed: \(error.localizedDescription)"))
                         self.log("Failed to load RSA key: \(error.localizedDescription)")
@@ -260,14 +286,19 @@ final class ADBManager: ObservableObject {
                     result = "Connected"
                     self.updateConnectionState(.connected)
                     self.startKeepAlive()
+                    // Wait a moment before fetching device info to let connection stabilize
+                    try? await Task.sleep(nanoseconds: 200_000_000) // 200ms
                     self.fetchDeviceInfo()
                 } catch {
                     self.client = nil
                     result = "Connection failed"
                     self.updateConnectionState(.failed(error.localizedDescription))
                     self.log("\(result): \(error.localizedDescription)")
-                    self.log("Error: \(String(reflecting: error))")
                 }
+
+                self.connectionLock.lock()
+                self.isConnecting = false
+                self.connectionLock.unlock()
 
                 DispatchQueue.main.async {
                     self.connectionStatus = result
@@ -331,11 +362,25 @@ final class ADBManager: ObservableObject {
     }
 
     private func handleConnectionLost() {
+        // Check if we're already trying to connect
+        connectionLock.lock()
+        let alreadyConnecting = isConnecting
+        connectionLock.unlock()
+
+        if alreadyConnecting {
+            return // Already handling reconnection
+        }
+
         stopKeepAlive()
 
         guard autoReconnect, !lastConnectedIP.isEmpty, reconnectAttempts < maxReconnectAttempts else {
             updateConnectionState(.disconnected)
-            log("Connection lost")
+            if reconnectAttempts >= maxReconnectAttempts {
+                log("Connection lost - max reconnect attempts reached")
+            } else {
+                log("Connection lost")
+            }
+            reconnectAttempts = 0
             return
         }
 
@@ -343,12 +388,17 @@ final class ADBManager: ObservableObject {
         updateConnectionState(.reconnecting)
         log("Connection lost, attempting reconnect (\(reconnectAttempts)/\(maxReconnectAttempts))...")
 
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+        // Use exponential backoff: 1s, 2s, 4s
+        let delay = Double(1 << (reconnectAttempts - 1))
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
             guard let self else { return }
             self.connect(ipAddress: self.lastConnectedIP, keyStoragePath: self.lastKeyStoragePath) { result in
                 if result == "Connected" {
                     self.reconnectAttempts = 0
-                    self.refreshApps(includeSystem: self.includeSystemApps, force: true)
+                    // Wait before refreshing apps to let connection fully stabilize
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                        self.refreshApps(includeSystem: self.includeSystemApps, force: true)
+                    }
                 }
             }
         }
@@ -591,11 +641,123 @@ final class ADBManager: ObservableObject {
         totalIconsToLoad = appsNeedingIcons.count
         iconLoadingCount = 0
 
-        // Load icons in parallel - the operation queue will serialize ADB operations
-        let batchSize = 6
-        let batch = Array(appsNeedingIcons.prefix(batchSize))
-        for app in batch {
-            loadIcon(for: app)
+        // Queue icons for sequential loading to avoid overwhelming Fire TV
+        iconLoadQueue = appsNeedingIcons
+        loadNextIconInQueue()
+    }
+
+    private func loadNextIconInQueue() {
+        guard !isLoadingIconSequentially else { return }
+        guard let app = iconLoadQueue.first else { return }
+        guard isConnected else { return }
+
+        iconLoadQueue.removeFirst()
+        isLoadingIconSequentially = true
+        loadIconSequentially(for: app)
+    }
+
+    private func loadIconSequentially(for app: AppInfo) {
+        guard app.iconData == nil else {
+            isLoadingIconSequentially = false
+            // Small delay before next icon to prevent overwhelming the connection
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
+                self?.loadNextIconInQueue()
+            }
+            return
+        }
+        guard let apkPath = app.apkPath else {
+            isLoadingIconSequentially = false
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
+                self?.loadNextIconInQueue()
+            }
+            return
+        }
+        guard let client else {
+            isLoadingIconSequentially = false
+            return
+        }
+        guard beginIconLoad(for: app.packageName) else {
+            isLoadingIconSequentially = false
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
+                self?.loadNextIconInQueue()
+            }
+            return
+        }
+
+        let packageName = app.packageName
+
+        DispatchQueue.main.async {
+            if let index = self.apps.firstIndex(where: { $0.packageName == packageName }) {
+                self.apps[index].isLoadingIcon = true
+            }
+        }
+
+        iconQueue.async { [weak self] in
+            guard let self else { return }
+
+            let cacheURL = self.iconCacheURL(for: packageName)
+            if FileManager.default.fileExists(atPath: cacheURL.path),
+               let data = try? Data(contentsOf: cacheURL) {
+                DispatchQueue.main.async {
+                    self.updateAppIcon(package: packageName, data: data)
+                    self.incrementIconLoadCount()
+                    self.isLoadingIconSequentially = false
+                    // Small delay before next icon
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                        self.loadNextIconInQueue()
+                    }
+                }
+                self.endIconLoad(for: packageName)
+                return
+            }
+
+            Task {
+                defer {
+                    DispatchQueue.main.async {
+                        self.incrementIconLoadCount()
+                        self.isLoadingIconSequentially = false
+                        // Longer delay after ADB operation to let connection recover
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+                            self.loadNextIconInQueue()
+                        }
+                    }
+                    self.endIconLoad(for: packageName)
+                }
+
+                do {
+                    let resolvedPath = await self.resolveApkPath(apkPath, client: client)
+
+                    let tempApkURL = FileManager.default.temporaryDirectory.appendingPathComponent("\(packageName).apk")
+                    if FileManager.default.fileExists(atPath: tempApkURL.path) {
+                        try? FileManager.default.removeItem(at: tempApkURL)
+                    }
+                    try await client.pullFile(remotePath: resolvedPath, localURL: tempApkURL)
+                    if let iconData = APKIconExtractor.extractIcon(from: tempApkURL) {
+                        guard let finalData = self.normalizeIconData(iconData) else {
+                            DispatchQueue.main.async {
+                                self.updateAppIconLoadingState(package: packageName, loading: false)
+                            }
+                            return
+                        }
+                        try? FileManager.default.createDirectory(at: cacheURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+                        try? finalData.write(to: cacheURL)
+                        DispatchQueue.main.async {
+                            self.updateAppIcon(package: packageName, data: finalData)
+                        }
+                    } else {
+                        DispatchQueue.main.async {
+                            self.updateAppIconLoadingState(package: packageName, loading: false)
+                        }
+                    }
+
+                    try? FileManager.default.removeItem(at: tempApkURL)
+                } catch {
+                    self.log("Icon load failed for \(packageName): \(error.localizedDescription)")
+                    DispatchQueue.main.async {
+                        self.updateAppIconLoadingState(package: packageName, loading: false)
+                    }
+                }
+            }
         }
     }
 
@@ -634,76 +796,15 @@ final class ADBManager: ObservableObject {
     }
 
     func loadIcon(for app: AppInfo) {
+        // Add to queue for sequential loading to avoid overwhelming Fire TV
         guard app.iconData == nil else { return }
-        guard let apkPath = app.apkPath else { return }
-        guard let client else { return }
-        guard beginIconLoad(for: app.packageName) else { return }
-        let packageName = app.packageName
+        guard app.apkPath != nil else { return }
+        guard !iconLoadsInProgress.contains(app.packageName) else { return }
 
-        DispatchQueue.main.async {
-            if let index = self.apps.firstIndex(where: { $0.packageName == packageName }) {
-                self.apps[index].isLoadingIcon = true
-            }
+        if !iconLoadQueue.contains(where: { $0.packageName == app.packageName }) {
+            iconLoadQueue.append(app)
         }
-
-        iconQueue.async { [weak self] in
-            guard let self else { return }
-
-            let cacheURL = self.iconCacheURL(for: packageName)
-            if FileManager.default.fileExists(atPath: cacheURL.path),
-               let data = try? Data(contentsOf: cacheURL) {
-                DispatchQueue.main.async {
-                    self.updateAppIcon(package: packageName, data: data)
-                    self.incrementIconLoadCount()
-                }
-                self.endIconLoad(for: packageName)
-                return
-            }
-
-            Task {
-                do {
-                    // Resolve the actual APK file path
-                    // On newer Android versions, the path is a directory containing base.apk
-                    let resolvedPath = await self.resolveApkPath(apkPath, client: client)
-
-                    let tempApkURL = FileManager.default.temporaryDirectory.appendingPathComponent("\(packageName).apk")
-                    if FileManager.default.fileExists(atPath: tempApkURL.path) {
-                        try? FileManager.default.removeItem(at: tempApkURL)
-                    }
-                    try await client.pullFile(remotePath: resolvedPath, localURL: tempApkURL)
-                    if let iconData = APKIconExtractor.extractIcon(from: tempApkURL) {
-                        guard let finalData = self.normalizeIconData(iconData) else {
-                            DispatchQueue.main.async {
-                                self.updateAppIconLoadingState(package: packageName, loading: false)
-                            }
-                            self.endIconLoad(for: packageName)
-                            return
-                        }
-                        try? FileManager.default.createDirectory(at: cacheURL.deletingLastPathComponent(), withIntermediateDirectories: true)
-                        try? finalData.write(to: cacheURL)
-                        DispatchQueue.main.async {
-                            self.updateAppIcon(package: packageName, data: finalData)
-                        }
-                    } else {
-                        DispatchQueue.main.async {
-                            self.updateAppIconLoadingState(package: packageName, loading: false)
-                        }
-                    }
-
-                    try? FileManager.default.removeItem(at: tempApkURL)
-                } catch {
-                    self.log("Icon load failed for \(packageName): \(error.localizedDescription)")
-                    DispatchQueue.main.async {
-                        self.updateAppIconLoadingState(package: packageName, loading: false)
-                    }
-                }
-
-                DispatchQueue.main.async {
-                    self.incrementIconLoadCount()
-                }
-                self.endIconLoad(for: packageName)
-            }
-        }
+        loadNextIconInQueue()
     }
 
     private func resolveApkPath(_ path: String, client: ADBClient) async -> String {
