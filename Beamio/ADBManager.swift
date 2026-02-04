@@ -143,9 +143,66 @@ final class ADBManager: ObservableObject {
     private var reconnectAttempts: Int = 0
     private let maxReconnectAttempts: Int = 3
 
+    // Cached key pair for connection stability
+    private var cachedKeyPair: ADBKeyPair?
+    private var wasConnectedBeforeBackground: Bool = false
+
     private init() {
         loadUpdateSources()
         loadSettings()
+        setupAppLifecycleObservers()
+        // Pre-load the RSA key pair on init to ensure it's ready
+        preloadKeyPair()
+    }
+
+    private func preloadKeyPair() {
+        let keyStoragePath = ADBKeyStorage.path()
+        workerQueue.async { [weak self] in
+            do {
+                let keyPair = try ADBKeyManager.loadOrCreateKeyPair(at: keyStoragePath)
+                self?.cachedKeyPair = keyPair
+                DispatchQueue.main.async {
+                    self?.log("RSA key pair loaded successfully")
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    self?.log("Failed to preload RSA key: \(error.localizedDescription)")
+                }
+            }
+        }
+    }
+
+    private func setupAppLifecycleObservers() {
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(appWillResignActive),
+            name: UIApplication.willResignActiveNotification,
+            object: nil
+        )
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(appDidBecomeActive),
+            name: UIApplication.didBecomeActiveNotification,
+            object: nil
+        )
+    }
+
+    @objc private func appWillResignActive() {
+        wasConnectedBeforeBackground = isConnected
+        if isConnected {
+            log("App entering background, connection may be interrupted")
+        }
+    }
+
+    @objc private func appDidBecomeActive() {
+        if wasConnectedBeforeBackground && !isConnected && autoReconnect && !lastConnectedIP.isEmpty {
+            log("App returned to foreground, attempting to restore connection...")
+            reconnectAttempts = 0
+            connect(ipAddress: lastConnectedIP, keyStoragePath: lastKeyStoragePath)
+        } else if isConnected {
+            // Verify connection is still alive
+            performKeepAlive()
+        }
     }
 
     private func loadSettings() {
@@ -173,13 +230,32 @@ final class ADBManager: ObservableObject {
 
         workerQueue.async { [weak self] in
             guard let self else { return }
+
+            // Use cached key pair or load one
+            let keyPair: ADBKeyPair
+            if let cached = self.cachedKeyPair {
+                keyPair = cached
+            } else {
+                do {
+                    keyPair = try ADBKeyManager.loadOrCreateKeyPair(at: keyStoragePath)
+                    self.cachedKeyPair = keyPair
+                } catch {
+                    DispatchQueue.main.async {
+                        self.updateConnectionState(.failed("Key generation failed: \(error.localizedDescription)"))
+                        self.log("Failed to load RSA key: \(error.localizedDescription)")
+                        completion?("Connection failed")
+                    }
+                    return
+                }
+            }
+
             let client = ADBClient(timeout: self.connectionTimeout) { [weak self] message in
                 self?.log(message)
             }
             Task {
                 let result: String
                 do {
-                    try await client.connect(host: host, port: port, keyStoragePath: keyStoragePath)
+                    try await client.connect(host: host, port: port, keyPair: keyPair)
                     self.client = client
                     result = "Connected"
                     self.updateConnectionState(.connected)
@@ -874,20 +950,19 @@ private final class ADBClient {
         self.logger = logger
     }
 
-    func connect(host: String, port: UInt16, keyStoragePath: String) async throws {
+    func connect(host: String, port: UInt16, keyPair: ADBKeyPair) async throws {
         try await enqueue {
-            try await self.performConnect(host: host, port: port, keyStoragePath: keyStoragePath)
+            try await self.performConnect(host: host, port: port, keyPair: keyPair)
         }
     }
 
-    private func performConnect(host: String, port: UInt16, keyStoragePath: String) async throws {
+    private func performConnect(host: String, port: UInt16, keyPair: ADBKeyPair) async throws {
         guard !host.isEmpty else { throw ADBError.invalidHost }
 
         let connection = ADBConnection(host: host, port: port, logger: logger)
         try await connection.start(timeout: timeout)
         self.connection = connection
 
-        let keyPair = try ADBKeyManager.loadOrCreateKeyPair(at: keyStoragePath)
         self.keyPair = keyPair
 
         let localMaxData: UInt32 = 4096
@@ -1774,23 +1849,34 @@ private final class ADBConnection {
     }
 }
 
-private struct ADBKeyPair {
+struct ADBKeyPair {
     let privateKey: SecKey
     let publicKey: String
 }
 
-private enum ADBKeyManager {
+enum ADBKeyManager {
     static func loadOrCreateKeyPair(at path: String) throws -> ADBKeyPair {
         let keyURL = resolveKeyURL(path: path)
         let pubURL = keyURL.appendingPathExtension("pub")
 
-        if FileManager.default.fileExists(atPath: keyURL.path),
-           let data = try? Data(contentsOf: keyURL),
-           let privateKey = createPrivateKey(from: data) {
+        // 1. Try loading from Keychain first (most reliable)
+        if let keychainData = ADBKeyStorage.loadFromKeychain(),
+           let privateKey = createPrivateKey(from: keychainData) {
             let publicKey = (try? String(contentsOf: pubURL, encoding: .utf8)) ?? createPublicKeyString(from: privateKey)
             return ADBKeyPair(privateKey: privateKey, publicKey: publicKey)
         }
 
+        // 2. Try loading from file (fallback)
+        if FileManager.default.fileExists(atPath: keyURL.path),
+           let data = try? Data(contentsOf: keyURL),
+           let privateKey = createPrivateKey(from: data) {
+            // Found in file but not in Keychain - save to Keychain for future
+            _ = ADBKeyStorage.saveToKeychain(data)
+            let publicKey = (try? String(contentsOf: pubURL, encoding: .utf8)) ?? createPublicKeyString(from: privateKey)
+            return ADBKeyPair(privateKey: privateKey, publicKey: publicKey)
+        }
+
+        // 3. Generate new key pair
         let attributes: [String: Any] = [
             kSecAttrKeyType as String: kSecAttrKeyTypeRSA,
             kSecAttrKeySizeInBits as String: 2048,
@@ -1807,6 +1893,10 @@ private enum ADBKeyManager {
             throw ADBError.keyGenerationFailed(message)
         }
 
+        // Save to Keychain (primary)
+        _ = ADBKeyStorage.saveToKeychain(privateData)
+
+        // Save to file (backup)
         try FileManager.default.createDirectory(at: keyURL.deletingLastPathComponent(), withIntermediateDirectories: true)
         try privateData.write(to: keyURL)
 

@@ -4,7 +4,10 @@ import SwiftUI
 
 /// Provides a consistent path for ADB key storage across the app
 enum ADBKeyStorage {
-    /// Returns a consistent path for storing the ADB key pair
+    private static let keychainService = "com.beamio.adb.keys"
+    private static let keychainAccount = "adb_private_key"
+
+    /// Returns a consistent path for storing the ADB key pair (file-based backup)
     static func path() -> String {
         let fileManager = FileManager.default
         guard let appSupport = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask).first else {
@@ -19,6 +22,53 @@ enum ADBKeyStorage {
         let keyDir = appSupport.appendingPathComponent("ADBKeys", isDirectory: true)
         try? fileManager.createDirectory(at: keyDir, withIntermediateDirectories: true)
         return keyDir.path
+    }
+
+    /// Save private key data to Keychain
+    static func saveToKeychain(_ data: Data) -> Bool {
+        // Delete any existing key first
+        let deleteQuery: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: keychainService,
+            kSecAttrAccount as String: keychainAccount
+        ]
+        SecItemDelete(deleteQuery as CFDictionary)
+
+        // Add new key
+        let addQuery: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: keychainService,
+            kSecAttrAccount as String: keychainAccount,
+            kSecValueData as String: data,
+            kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlock
+        ]
+
+        let status = SecItemAdd(addQuery as CFDictionary, nil)
+        return status == errSecSuccess
+    }
+
+    /// Load private key data from Keychain
+    static func loadFromKeychain() -> Data? {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: keychainService,
+            kSecAttrAccount as String: keychainAccount,
+            kSecReturnData as String: true,
+            kSecMatchLimit as String: kSecMatchLimitOne
+        ]
+
+        var result: AnyObject?
+        let status = SecItemCopyMatching(query as CFDictionary, &result)
+
+        if status == errSecSuccess, let data = result as? Data {
+            return data
+        }
+        return nil
+    }
+
+    /// Check if key exists in Keychain
+    static func hasKeychainKey() -> Bool {
+        return loadFromKeychain() != nil
     }
 }
 
