@@ -4,7 +4,10 @@ import SwiftUI
 
 /// Provides a consistent path for ADB key storage across the app
 enum ADBKeyStorage {
-    /// Returns a consistent path for storing the ADB key pair
+    private static let keychainService = "com.beamio.adb.keys"
+    private static let keychainAccount = "adb_private_key"
+
+    /// Returns a consistent path for storing the ADB key pair (file-based backup)
     static func path() -> String {
         let fileManager = FileManager.default
         guard let appSupport = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask).first else {
@@ -20,12 +23,58 @@ enum ADBKeyStorage {
         try? fileManager.createDirectory(at: keyDir, withIntermediateDirectories: true)
         return keyDir.path
     }
+
+    /// Save private key data to Keychain
+    static func saveToKeychain(_ data: Data) -> Bool {
+        // Delete any existing key first
+        let deleteQuery: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: keychainService,
+            kSecAttrAccount as String: keychainAccount
+        ]
+        SecItemDelete(deleteQuery as CFDictionary)
+
+        // Add new key
+        let addQuery: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: keychainService,
+            kSecAttrAccount as String: keychainAccount,
+            kSecValueData as String: data,
+            kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlock
+        ]
+
+        let status = SecItemAdd(addQuery as CFDictionary, nil)
+        return status == errSecSuccess
+    }
+
+    /// Load private key data from Keychain
+    static func loadFromKeychain() -> Data? {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: keychainService,
+            kSecAttrAccount as String: keychainAccount,
+            kSecReturnData as String: true,
+            kSecMatchLimit as String: kSecMatchLimitOne
+        ]
+
+        var result: AnyObject?
+        let status = SecItemCopyMatching(query as CFDictionary, &result)
+
+        if status == errSecSuccess, let data = result as? Data {
+            return data
+        }
+        return nil
+    }
+
+    /// Check if key exists in Keychain
+    static func hasKeychainKey() -> Bool {
+        return loadFromKeychain() != nil
+    }
 }
 
 struct ConnectionPanel: View {
     @EnvironmentObject private var adbManager: ADBManager
-    @AppStorage("fireTVIP") private var fireTVIP: String = ""
-    @AppStorage("autoConnectOnLaunch") private var autoConnectOnLaunch: Bool = false
+    @ObservedObject private var settings = AppSettings.shared
 
     @State private var hasAttemptedAutoConnect = false
 
@@ -54,7 +103,7 @@ struct ConnectionPanel: View {
                     )
                 }
 
-                TextField("192.168.0.21:5555", text: $fireTVIP)
+                TextField("192.168.0.21:5555", text: $settings.fireTVIP)
                     .keyboardType(.numbersAndPunctuation)
                     .textInputAutocapitalization(.never)
                     .autocorrectionDisabled()
@@ -114,10 +163,10 @@ struct ConnectionPanel: View {
     @ViewBuilder
     private var validationText: some View {
         HStack(spacing: 4) {
-            Image(systemName: BeamioValidator.isValidIP(fireTVIP) ? "checkmark.circle" : "info.circle")
+            Image(systemName: BeamioValidator.isValidIP(settings.fireTVIP) ? "checkmark.circle" : "info.circle")
                 .font(.system(size: 11))
 
-            Text(BeamioValidator.isValidIP(fireTVIP) ? "Ready to connect" : "Enter a valid IPv4 address")
+            Text(BeamioValidator.isValidIP(settings.fireTVIP) ? "Ready to connect" : "Enter a valid IPv4 address")
                 .font(BeamioTheme.captionFont(11))
         }
         .foregroundColor(.secondary)
@@ -141,7 +190,7 @@ struct ConnectionPanel: View {
             }
         }
         .buttonStyle(PrimaryButtonStyle())
-        .disabled(!BeamioValidator.isValidIP(fireTVIP) || isConnecting)
+        .disabled(!BeamioValidator.isValidIP(settings.fireTVIP) || isConnecting)
     }
 
     private var buttonTitle: String {
@@ -159,22 +208,20 @@ struct ConnectionPanel: View {
 
     private func performConnect() {
         let storagePath = ADBKeyStorage.path()
-        adbManager.connect(ipAddress: fireTVIP, keyStoragePath: storagePath)
+        adbManager.connect(ipAddress: settings.fireTVIP, keyStoragePath: storagePath)
     }
 
     private func attemptAutoConnect() {
         guard !hasAttemptedAutoConnect else { return }
         hasAttemptedAutoConnect = true
 
-        guard autoConnectOnLaunch,
+        guard settings.autoConnectOnLaunch,
               !adbManager.isConnected,
-              BeamioValidator.isValidIP(fireTVIP) else {
+              BeamioValidator.isValidIP(settings.fireTVIP) else {
             return
         }
 
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-            performConnect()
-        }
+        performConnect()
     }
 }
 
@@ -182,12 +229,12 @@ struct ConnectionPanel: View {
 
 struct CompactConnectionPanel: View {
     @EnvironmentObject private var adbManager: ADBManager
-    @AppStorage("fireTVIP") private var fireTVIP: String = ""
+    @ObservedObject private var settings = AppSettings.shared
 
     var body: some View {
         Button {
             let storagePath = ADBKeyStorage.path()
-            adbManager.connect(ipAddress: fireTVIP, keyStoragePath: storagePath)
+            adbManager.connect(ipAddress: settings.fireTVIP, keyStoragePath: storagePath)
         } label: {
             HStack(spacing: 6) {
                 Image(systemName: "link")
@@ -196,7 +243,7 @@ struct CompactConnectionPanel: View {
             }
         }
         .buttonStyle(PrimaryButtonStyle())
-        .disabled(!BeamioValidator.isValidIP(fireTVIP))
+        .disabled(!BeamioValidator.isValidIP(settings.fireTVIP))
     }
 }
 

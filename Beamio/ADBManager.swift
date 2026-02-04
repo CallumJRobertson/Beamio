@@ -143,9 +143,66 @@ final class ADBManager: ObservableObject {
     private var reconnectAttempts: Int = 0
     private let maxReconnectAttempts: Int = 3
 
+    // Cached key pair for connection stability
+    private var cachedKeyPair: ADBKeyPair?
+    private var wasConnectedBeforeBackground: Bool = false
+
     private init() {
         loadUpdateSources()
         loadSettings()
+        setupAppLifecycleObservers()
+        // Pre-load the RSA key pair on init to ensure it's ready
+        preloadKeyPair()
+    }
+
+    private func preloadKeyPair() {
+        let keyStoragePath = ADBKeyStorage.path()
+        workerQueue.async { [weak self] in
+            do {
+                let keyPair = try ADBKeyManager.loadOrCreateKeyPair(at: keyStoragePath)
+                self?.cachedKeyPair = keyPair
+                DispatchQueue.main.async {
+                    self?.log("RSA key pair loaded successfully")
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    self?.log("Failed to preload RSA key: \(error.localizedDescription)")
+                }
+            }
+        }
+    }
+
+    private func setupAppLifecycleObservers() {
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(appWillResignActive),
+            name: UIApplication.willResignActiveNotification,
+            object: nil
+        )
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(appDidBecomeActive),
+            name: UIApplication.didBecomeActiveNotification,
+            object: nil
+        )
+    }
+
+    @objc private func appWillResignActive() {
+        wasConnectedBeforeBackground = isConnected
+        if isConnected {
+            log("App entering background, connection may be interrupted")
+        }
+    }
+
+    @objc private func appDidBecomeActive() {
+        if wasConnectedBeforeBackground && !isConnected && autoReconnect && !lastConnectedIP.isEmpty {
+            log("App returned to foreground, attempting to restore connection...")
+            reconnectAttempts = 0
+            connect(ipAddress: lastConnectedIP, keyStoragePath: lastKeyStoragePath)
+        } else if isConnected {
+            // Verify connection is still alive
+            performKeepAlive()
+        }
     }
 
     private func loadSettings() {
@@ -173,13 +230,32 @@ final class ADBManager: ObservableObject {
 
         workerQueue.async { [weak self] in
             guard let self else { return }
+
+            // Use cached key pair or load one
+            let keyPair: ADBKeyPair
+            if let cached = self.cachedKeyPair {
+                keyPair = cached
+            } else {
+                do {
+                    keyPair = try ADBKeyManager.loadOrCreateKeyPair(at: keyStoragePath)
+                    self.cachedKeyPair = keyPair
+                } catch {
+                    DispatchQueue.main.async {
+                        self.updateConnectionState(.failed("Key generation failed: \(error.localizedDescription)"))
+                        self.log("Failed to load RSA key: \(error.localizedDescription)")
+                        completion?("Connection failed")
+                    }
+                    return
+                }
+            }
+
             let client = ADBClient(timeout: self.connectionTimeout) { [weak self] message in
                 self?.log(message)
             }
             Task {
                 let result: String
                 do {
-                    try await client.connect(host: host, port: port, keyStoragePath: keyStoragePath)
+                    try await client.connect(host: host, port: port, keyPair: keyPair)
                     self.client = client
                     result = "Connected"
                     self.updateConnectionState(.connected)
@@ -267,7 +343,7 @@ final class ADBManager: ObservableObject {
         updateConnectionState(.reconnecting)
         log("Connection lost, attempting reconnect (\(reconnectAttempts)/\(maxReconnectAttempts))...")
 
-        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
             guard let self else { return }
             self.connect(ipAddress: self.lastConnectedIP, keyStoragePath: self.lastKeyStoragePath) { result in
                 if result == "Connected" {
@@ -492,10 +568,7 @@ final class ADBManager: ObservableObject {
                         self.isRefreshing = false
                         self.appsError = nil
                         self.log("Loaded \(fetched.count) apps.")
-                        // Add a small delay before loading icons to let the UI settle
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-                            self.preloadVisibleIcons()
-                        }
+                        self.preloadVisibleIcons()
                     }
                 } catch {
                     DispatchQueue.main.async {
@@ -518,14 +591,11 @@ final class ADBManager: ObservableObject {
         totalIconsToLoad = appsNeedingIcons.count
         iconLoadingCount = 0
 
-        // Load icons one at a time with delays to prevent stream conflicts
-        let batchSize = 3
+        // Load icons in parallel - the operation queue will serialize ADB operations
+        let batchSize = 6
         let batch = Array(appsNeedingIcons.prefix(batchSize))
-        for (index, app) in batch.enumerated() {
-            // Stagger icon loads to prevent overwhelming the ADB connection
-            DispatchQueue.main.asyncAfter(deadline: .now() + Double(index) * 0.5) { [weak self] in
-                self?.loadIcon(for: app)
-            }
+        for app in batch {
+            loadIcon(for: app)
         }
     }
 
@@ -880,20 +950,19 @@ private final class ADBClient {
         self.logger = logger
     }
 
-    func connect(host: String, port: UInt16, keyStoragePath: String) async throws {
+    func connect(host: String, port: UInt16, keyPair: ADBKeyPair) async throws {
         try await enqueue {
-            try await self.performConnect(host: host, port: port, keyStoragePath: keyStoragePath)
+            try await self.performConnect(host: host, port: port, keyPair: keyPair)
         }
     }
 
-    private func performConnect(host: String, port: UInt16, keyStoragePath: String) async throws {
+    private func performConnect(host: String, port: UInt16, keyPair: ADBKeyPair) async throws {
         guard !host.isEmpty else { throw ADBError.invalidHost }
 
         let connection = ADBConnection(host: host, port: port, logger: logger)
         try await connection.start(timeout: timeout)
         self.connection = connection
 
-        let keyPair = try ADBKeyManager.loadOrCreateKeyPair(at: keyStoragePath)
         self.keyPair = keyPair
 
         let localMaxData: UInt32 = 4096
@@ -1008,8 +1077,6 @@ private final class ADBClient {
         var apps: [AppInfo] = []
 
         for package in targetPackages.sorted() {
-            // Add a small delay between package detail fetches to prevent stream conflicts
-            try? await Task.sleep(nanoseconds: 50_000_000) // 50ms
             let details = try? await fetchPackageDetails(package)
             let apkPath = packagePaths[package] ?? details?.codePath
             let installer = installers[package] ?? details?.installer
@@ -1089,14 +1156,9 @@ private final class ADBClient {
         return String(data: data, encoding: .utf8) ?? ""
     }
 
-    private func runShellOptional(_ command: String, delay: UInt64 = 100_000_000) async -> String {
+    private func runShellOptional(_ command: String) async -> String {
         do {
-            let result = try await runShell(command)
-            // Small delay to let the ADB connection settle between commands
-            if delay > 0 {
-                try? await Task.sleep(nanoseconds: delay)
-            }
-            return result
+            return try await runShell(command)
         } catch {
             trace("Shell command failed (\(command)): \(error.localizedDescription)")
             return ""
@@ -1589,10 +1651,12 @@ private final class ADBClient {
     }
 
     private func tracePacket(direction: String, command: ADBCommand, arg0: UInt32, arg1: UInt32, length: UInt32, checksum: UInt32, data: Data) {
+        // Heavily throttle packet logging to reduce noise
         if command == .okay {
             okayPacketCount += 1
-            if okayPacketCount <= 5 || okayPacketCount % 50 == 0 {
-                trace("\(direction) \(command.name) arg0=\(arg0) arg1=\(arg1) len=\(length)")
+            // Only log first packet and then every 500th
+            if okayPacketCount == 1 {
+                trace("\(direction) \(command.name) (subsequent OKAY packets suppressed)")
             }
             return
         }
@@ -1600,18 +1664,24 @@ private final class ADBClient {
         if command == .wrte, let syncId = syncCommandId(from: data) {
             if syncId == "DATA" {
                 dataPacketCount += 1
-                if dataPacketCount <= 3 || dataPacketCount % 100 == 0 {
-                    trace("\(direction) \(command.name) id=DATA chunk=\(dataPacketCount) bytes=\(data.count)")
+                // Only log first DATA packet
+                if dataPacketCount == 1 {
+                    trace("\(direction) \(command.name) id=DATA (subsequent DATA packets suppressed)")
                 }
                 return
             }
-            let payloadPreview = data.hexPreview(maxBytes: 64)
-            trace("\(direction) \(command.name) id=\(syncId) arg0=\(arg0) arg1=\(arg1) len=\(length) checksum=\(checksum) data=\(payloadPreview)")
+            // Suppress other sync commands except SEND/RECV/DONE/FAIL
+            if syncId != "SEND" && syncId != "RECV" && syncId != "DONE" && syncId != "FAIL" {
+                return
+            }
+            trace("\(direction) \(command.name) id=\(syncId) len=\(length)")
             return
         }
 
-        let payloadPreview = data.hexPreview(maxBytes: 64)
-        trace("\(direction) \(command.name) arg0=\(arg0) arg1=\(arg1) len=\(length) checksum=\(checksum) data=\(payloadPreview)")
+        // Only log important commands
+        if command == .open || command == .clse {
+            trace("\(direction) \(command.name) arg0=\(arg0) arg1=\(arg1)")
+        }
     }
 
     private func syncCommandId(from data: Data) -> String? {
@@ -1779,23 +1849,34 @@ private final class ADBConnection {
     }
 }
 
-private struct ADBKeyPair {
+struct ADBKeyPair {
     let privateKey: SecKey
     let publicKey: String
 }
 
-private enum ADBKeyManager {
+enum ADBKeyManager {
     static func loadOrCreateKeyPair(at path: String) throws -> ADBKeyPair {
         let keyURL = resolveKeyURL(path: path)
         let pubURL = keyURL.appendingPathExtension("pub")
 
-        if FileManager.default.fileExists(atPath: keyURL.path),
-           let data = try? Data(contentsOf: keyURL),
-           let privateKey = createPrivateKey(from: data) {
+        // 1. Try loading from Keychain first (most reliable)
+        if let keychainData = ADBKeyStorage.loadFromKeychain(),
+           let privateKey = createPrivateKey(from: keychainData) {
             let publicKey = (try? String(contentsOf: pubURL, encoding: .utf8)) ?? createPublicKeyString(from: privateKey)
             return ADBKeyPair(privateKey: privateKey, publicKey: publicKey)
         }
 
+        // 2. Try loading from file (fallback)
+        if FileManager.default.fileExists(atPath: keyURL.path),
+           let data = try? Data(contentsOf: keyURL),
+           let privateKey = createPrivateKey(from: data) {
+            // Found in file but not in Keychain - save to Keychain for future
+            _ = ADBKeyStorage.saveToKeychain(data)
+            let publicKey = (try? String(contentsOf: pubURL, encoding: .utf8)) ?? createPublicKeyString(from: privateKey)
+            return ADBKeyPair(privateKey: privateKey, publicKey: publicKey)
+        }
+
+        // 3. Generate new key pair
         let attributes: [String: Any] = [
             kSecAttrKeyType as String: kSecAttrKeyTypeRSA,
             kSecAttrKeySizeInBits as String: 2048,
@@ -1812,6 +1893,10 @@ private enum ADBKeyManager {
             throw ADBError.keyGenerationFailed(message)
         }
 
+        // Save to Keychain (primary)
+        _ = ADBKeyStorage.saveToKeychain(privateData)
+
+        // Save to file (backup)
         try FileManager.default.createDirectory(at: keyURL.deletingLastPathComponent(), withIntermediateDirectories: true)
         try privateData.write(to: keyURL)
 

@@ -2,7 +2,7 @@ import SwiftUI
 
 struct OnboardingView: View {
     @EnvironmentObject private var adbManager: ADBManager
-    @AppStorage("hasOnboarded") private var hasOnboarded: Bool = false
+    @ObservedObject private var settings = AppSettings.shared
 
     var body: some View {
         ZStack {
@@ -37,7 +37,7 @@ struct OnboardingView: View {
 
                     if adbManager.isConnected {
                         Button("Continue") {
-                            hasOnboarded = true
+                            settings.hasOnboarded = true
                         }
                         .buttonStyle(PrimaryButtonStyle())
                         .padding(.bottom, 24)

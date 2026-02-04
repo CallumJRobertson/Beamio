@@ -108,7 +108,6 @@ struct DashboardView: View {
 
     private func refreshApps() async {
         adbManager.refreshApps()
-        try? await Task.sleep(nanoseconds: 1_000_000_000)
     }
 
     // MARK: - Header Section
