@@ -20,6 +20,10 @@ final class AppSettings: ObservableObject {
     // MARK: - Log Settings
     @AppStorage("hideADBLogs") var hideADBLogs: Bool = true
 
+    // MARK: - Performance
+    // Fetching icons by pulling APKs from the device is very slow and can interfere with installs/updates.
+    @AppStorage("downloadDeviceIcons") var downloadDeviceIcons: Bool = false
+
     private init() {}
 
     /// Reset all settings to defaults
@@ -30,5 +34,6 @@ final class AppSettings: ObservableObject {
         directApkURL = ""
         hasOnboarded = false
         hideADBLogs = true
+        downloadDeviceIcons = false
     }
 }

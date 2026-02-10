@@ -26,25 +26,32 @@ enum ADBKeyStorage {
 
     /// Save private key data to Keychain
     static func saveToKeychain(_ data: Data) -> Bool {
-        // Delete any existing key first
-        let deleteQuery: [String: Any] = [
+        // Prefer update-in-place so a transient add failure can't wipe an existing key.
+        let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: keychainService,
             kSecAttrAccount as String: keychainAccount
         ]
-        SecItemDelete(deleteQuery as CFDictionary)
 
-        // Add new key
-        let addQuery: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: keychainService,
-            kSecAttrAccount as String: keychainAccount,
-            kSecValueData as String: data,
-            kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlock
+        // Only update the data. Some Keychain attributes (like accessibility) can't always be updated in-place.
+        let attributes: [String: Any] = [
+            kSecValueData as String: data
         ]
 
-        let status = SecItemAdd(addQuery as CFDictionary, nil)
-        return status == errSecSuccess
+        let updateStatus = SecItemUpdate(query as CFDictionary, attributes as CFDictionary)
+        if updateStatus == errSecSuccess {
+            return true
+        }
+
+        if updateStatus != errSecItemNotFound {
+            return false
+        }
+
+        var addQuery = query
+        addQuery[kSecValueData as String] = data
+        addQuery[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlock
+        let addStatus = SecItemAdd(addQuery as CFDictionary, nil)
+        return addStatus == errSecSuccess
     }
 
     /// Load private key data from Keychain

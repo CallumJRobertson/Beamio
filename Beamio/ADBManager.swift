@@ -78,6 +78,7 @@ enum ADBError: Error, LocalizedError {
     case authenticationFailed
     case streamClosed
     case syncFailed(String)
+    case installFailed(String)
     case invalidResponse
     case keyGenerationFailed(String)
 
@@ -97,6 +98,8 @@ enum ADBError: Error, LocalizedError {
             return "ADB stream closed"
         case .syncFailed(let message):
             return "ADB sync failed: \(message)"
+        case .installFailed(let message):
+            return "Install failed: \(message)"
         case .invalidResponse:
             return "Invalid response"
         case .keyGenerationFailed(let message):
@@ -638,6 +641,27 @@ final class ADBManager: ObservableObject {
             app.iconData == nil && app.apkPath != nil && !iconLoadsInProgress.contains(app.packageName)
         }
 
+        // If icon downloading is disabled, only hydrate from local cache (fast) and skip device pulls (slow).
+        guard AppSettings.shared.downloadDeviceIcons else {
+            totalIconsToLoad = 0
+            iconLoadingCount = 0
+            iconLoadQueue = []
+
+            iconQueue.async { [weak self] in
+                guard let self else { return }
+                for app in appsNeedingIcons {
+                    let cacheURL = self.iconCacheURL(for: app.packageName)
+                    if FileManager.default.fileExists(atPath: cacheURL.path),
+                       let data = try? Data(contentsOf: cacheURL) {
+                        DispatchQueue.main.async {
+                            self.updateAppIcon(package: app.packageName, data: data)
+                        }
+                    }
+                }
+            }
+            return
+        }
+
         totalIconsToLoad = appsNeedingIcons.count
         iconLoadingCount = 0
 
@@ -650,6 +674,7 @@ final class ADBManager: ObservableObject {
         guard !isLoadingIconSequentially else { return }
         guard let app = iconLoadQueue.first else { return }
         guard isConnected else { return }
+        guard !isInstalling else { return }
 
         iconLoadQueue.removeFirst()
         isLoadingIconSequentially = true
@@ -703,6 +728,19 @@ final class ADBManager: ObservableObject {
                     self.incrementIconLoadCount()
                     self.isLoadingIconSequentially = false
                     // Small delay before next icon
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                        self.loadNextIconInQueue()
+                    }
+                }
+                self.endIconLoad(for: packageName)
+                return
+            }
+
+            guard AppSettings.shared.downloadDeviceIcons, !self.isInstalling else {
+                DispatchQueue.main.async {
+                    self.updateAppIconLoadingState(package: packageName, loading: false)
+                    self.incrementIconLoadCount()
+                    self.isLoadingIconSequentially = false
                     DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
                         self.loadNextIconInQueue()
                     }
@@ -796,12 +834,29 @@ final class ADBManager: ObservableObject {
     }
 
     func loadIcon(for app: AppInfo) {
-        // Add to queue for sequential loading to avoid overwhelming Fire TV
         guard app.iconData == nil else { return }
-        guard app.apkPath != nil else { return }
-        guard !iconLoadsInProgress.contains(app.packageName) else { return }
+        let packageName = app.packageName
 
-        if !iconLoadQueue.contains(where: { $0.packageName == app.packageName }) {
+        // Always try local cache first (fast, no ADB).
+        iconQueue.async { [weak self] in
+            guard let self else { return }
+            let cacheURL = self.iconCacheURL(for: packageName)
+            if FileManager.default.fileExists(atPath: cacheURL.path),
+               let data = try? Data(contentsOf: cacheURL) {
+                DispatchQueue.main.async {
+                    self.updateAppIcon(package: packageName, data: data)
+                }
+            }
+        }
+
+        // Pulling APKs to extract icons is expensive; keep it opt-in.
+        guard AppSettings.shared.downloadDeviceIcons else { return }
+        guard !isInstalling else { return }
+        guard app.apkPath != nil else { return }
+        guard !iconLoadsInProgress.contains(packageName) else { return }
+
+        // Add to queue for sequential loading to avoid overwhelming Fire TV
+        if !iconLoadQueue.contains(where: { $0.packageName == packageName }) {
             iconLoadQueue.append(app)
         }
         loadNextIconInQueue()
@@ -968,14 +1023,23 @@ final class ADBManager: ObservableObject {
 
     private func updateInstall(status: String, progress: Double?, active: Bool) {
         if Thread.isMainThread {
+            let wasInstalling = isInstalling
             installStatus = status
             installProgress = progress
             isInstalling = active
+            if wasInstalling && !active {
+                // Resume any paused background work after installs/updates complete.
+                loadNextIconInQueue()
+            }
         } else {
             DispatchQueue.main.async { [weak self] in
+                let wasInstalling = self?.isInstalling ?? false
                 self?.installStatus = status
                 self?.installProgress = progress
                 self?.isInstalling = active
+                if wasInstalling && !active {
+                    self?.loadNextIconInQueue()
+                }
             }
         }
     }
@@ -1243,11 +1307,18 @@ private final class ADBClient {
         progress("Installing APK...", nil)
         let output = try await runShell("pm install -r /data/local/tmp/beamio_payload.apk")
         let trimmed = output.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        // Always try to clean up the payload, even on failure.
+        _ = try? await runShell("rm /data/local/tmp/beamio_payload.apk")
+
+        if trimmed.localizedCaseInsensitiveContains("failure") || trimmed.localizedCaseInsensitiveContains("install_failed") {
+            throw ADBError.installFailed(trimmed.isEmpty ? "Unknown error" : trimmed)
+        }
+
         if !trimmed.isEmpty {
             progress(trimmed, nil)
         }
 
-        _ = try? await runShell("rm /data/local/tmp/beamio_payload.apk")
         progress("Install complete.", 1)
     }
 
@@ -1418,6 +1489,7 @@ private final class ADBClient {
 
     private func pushFile(localURL: URL, remotePath: String, mode: Int, progress: ((Int64, Int64?) -> Void)? = nil) async throws {
         let stream = try await openStream(service: "sync:")
+        do {
         var buffer = Data()
         var bufferOffset = 0
 
@@ -1448,12 +1520,20 @@ private final class ADBClient {
                 let packet = try await readPacket()
                 switch packet.command {
                 case .wrte:
-                    guard packet.arg0 == stream.remoteId, packet.arg1 == stream.localId else { continue }
-                    buffer.append(packet.data)
-                    try await sendPacket(.okay, arg0: stream.localId, arg1: stream.remoteId, data: Data())
+                    if packet.arg0 == stream.remoteId, packet.arg1 == stream.localId {
+                        buffer.append(packet.data)
+                        try await sendPacket(.okay, arg0: stream.localId, arg1: stream.remoteId, data: Data())
+                    } else {
+                        // Unrelated payload; ACK and discard.
+                        try await sendPacket(.okay, arg0: packet.arg1, arg1: packet.arg0, data: Data())
+                    }
                 case .clse:
-                    try await sendPacket(.clse, arg0: stream.localId, arg1: stream.remoteId, data: Data())
-                    throw ADBError.streamClosed
+                    if packet.arg0 == stream.remoteId, packet.arg1 == stream.localId {
+                        try await sendPacket(.clse, arg0: stream.localId, arg1: stream.remoteId, data: Data())
+                        throw ADBError.streamClosed
+                    }
+                    // Unrelated close; ACK and keep waiting.
+                    try await sendPacket(.clse, arg0: packet.arg1, arg1: packet.arg0, data: Data())
                 default:
                     continue
                 }
@@ -1514,18 +1594,29 @@ private final class ADBClient {
         let responseLengthData = try await readBytes(4)
         let responseLength = responseLengthData.readUInt32LE(at: 0)
 
+        var errorToThrow: Error?
         if responseIdString == "OKAY" {
-            _ = responseLength
-            return
-        }
-
-        if responseIdString == "FAIL" {
+            if responseLength > 0 {
+                _ = try await readBytes(Int(responseLength))
+            }
+        } else if responseIdString == "FAIL" {
             let messageData = try await readBytes(Int(responseLength))
             let message = String(data: messageData, encoding: .utf8) ?? "Unknown error"
-            throw ADBError.syncFailed(message)
+            errorToThrow = ADBError.syncFailed(message)
+        } else {
+            errorToThrow = ADBError.invalidResponse
         }
 
-        throw ADBError.invalidResponse
+        // Best-effort close. Leaving sync streams open can cause stray CLSE packets that break future streams.
+        try? await sendPacket(.clse, arg0: stream.localId, arg1: stream.remoteId, data: Data())
+
+        if let errorToThrow {
+            throw errorToThrow
+        }
+        } catch {
+            try? await sendPacket(.clse, arg0: stream.localId, arg1: stream.remoteId, data: Data())
+            throw error
+        }
     }
 
     func pullFile(remotePath: String, localURL: URL) async throws {
@@ -1536,6 +1627,7 @@ private final class ADBClient {
 
     private func performPullFile(remotePath: String, localURL: URL) async throws {
         let stream = try await openStream(service: "sync:")
+        do {
         var buffer = Data()
         var bufferOffset = 0
 
@@ -1556,12 +1648,20 @@ private final class ADBClient {
                 let packet = try await readPacket()
                 switch packet.command {
                 case .wrte:
-                    guard packet.arg0 == stream.remoteId, packet.arg1 == stream.localId else { continue }
-                    buffer.append(packet.data)
-                    try await sendPacket(.okay, arg0: stream.localId, arg1: stream.remoteId, data: Data())
+                    if packet.arg0 == stream.remoteId, packet.arg1 == stream.localId {
+                        buffer.append(packet.data)
+                        try await sendPacket(.okay, arg0: stream.localId, arg1: stream.remoteId, data: Data())
+                    } else {
+                        // Unrelated payload; ACK and discard.
+                        try await sendPacket(.okay, arg0: packet.arg1, arg1: packet.arg0, data: Data())
+                    }
                 case .clse:
-                    try await sendPacket(.clse, arg0: stream.localId, arg1: stream.remoteId, data: Data())
-                    throw ADBError.streamClosed
+                    if packet.arg0 == stream.remoteId, packet.arg1 == stream.localId {
+                        try await sendPacket(.clse, arg0: stream.localId, arg1: stream.remoteId, data: Data())
+                        throw ADBError.streamClosed
+                    }
+                    // Unrelated close; ACK and keep waiting.
+                    try await sendPacket(.clse, arg0: packet.arg1, arg1: packet.arg0, data: Data())
                 default:
                     continue
                 }
@@ -1588,6 +1688,7 @@ private final class ADBClient {
         let handle = try FileHandle(forWritingTo: localURL)
         defer { try? handle.close() }
 
+        var didFinish = false
         while true {
             let responseId = try await readBytes(4)
             let responseIdString = String(data: responseId, encoding: .ascii) ?? ""
@@ -1601,7 +1702,8 @@ private final class ADBClient {
             }
 
             if responseIdString == "DONE" {
-                return
+                didFinish = true
+                break
             }
 
             if responseIdString == "FAIL" {
@@ -1611,6 +1713,15 @@ private final class ADBClient {
             }
 
             throw ADBError.invalidResponse
+        }
+        // Best-effort close; keeps subsequent streams from tripping over a late CLSE.
+        try? await sendPacket(.clse, arg0: stream.localId, arg1: stream.remoteId, data: Data())
+        if !didFinish {
+            throw ADBError.invalidResponse
+        }
+        } catch {
+            try? await sendPacket(.clse, arg0: stream.localId, arg1: stream.remoteId, data: Data())
+            throw error
         }
     }
 
@@ -1630,8 +1741,20 @@ private final class ADBClient {
                 if packet.arg1 == localId {
                     return ADBStream(localId: localId, remoteId: packet.arg0)
                 }
+                continue
             case .clse:
-                throw ADBError.streamClosed
+                // Ignore unrelated stream closures; they can legitimately arrive slightly later than the
+                // operation that created the stream. Always ACK them to keep the connection healthy.
+                if packet.arg1 == localId {
+                    try await sendPacket(.clse, arg0: localId, arg1: packet.arg0, data: Data())
+                    throw ADBError.streamClosed
+                }
+                try await sendPacket(.clse, arg0: packet.arg1, arg1: packet.arg0, data: Data())
+                continue
+            case .wrte:
+                // Unrelated payload; ACK and discard.
+                try await sendPacket(.okay, arg0: packet.arg1, arg1: packet.arg0, data: Data())
+                continue
             default:
                 continue
             }
@@ -1645,14 +1768,20 @@ private final class ADBClient {
             let packet = try await readPacket()
             switch packet.command {
             case .wrte:
-                guard packet.arg0 == stream.remoteId, packet.arg1 == stream.localId else { continue }
-                output.append(packet.data)
-                try await sendPacket(.okay, arg0: stream.localId, arg1: stream.remoteId, data: Data())
+                if packet.arg0 == stream.remoteId, packet.arg1 == stream.localId {
+                    output.append(packet.data)
+                    try await sendPacket(.okay, arg0: stream.localId, arg1: stream.remoteId, data: Data())
+                } else {
+                    // Unrelated payload; ACK and discard.
+                    try await sendPacket(.okay, arg0: packet.arg1, arg1: packet.arg0, data: Data())
+                }
             case .clse:
                 if packet.arg0 == stream.remoteId, packet.arg1 == stream.localId {
                     try await sendPacket(.clse, arg0: stream.localId, arg1: stream.remoteId, data: Data())
                     return output
                 }
+                // Unrelated close; ACK and keep waiting.
+                try await sendPacket(.clse, arg0: packet.arg1, arg1: packet.arg0, data: Data())
             default:
                 continue
             }
@@ -1684,14 +1813,22 @@ private final class ADBClient {
                 if packet.arg0 == stream.remoteId, packet.arg1 == stream.localId {
                     return
                 }
+                continue
             case .wrte:
-                guard packet.arg0 == stream.remoteId, packet.arg1 == stream.localId else { continue }
-                buffer.append(packet.data)
-                try await sendPacket(.okay, arg0: stream.localId, arg1: stream.remoteId, data: Data())
+                if packet.arg0 == stream.remoteId, packet.arg1 == stream.localId {
+                    buffer.append(packet.data)
+                    try await sendPacket(.okay, arg0: stream.localId, arg1: stream.remoteId, data: Data())
+                } else {
+                    // Unrelated payload; ACK and discard.
+                    try await sendPacket(.okay, arg0: packet.arg1, arg1: packet.arg0, data: Data())
+                }
             case .clse:
                 if packet.arg0 == stream.remoteId, packet.arg1 == stream.localId {
+                    try await sendPacket(.clse, arg0: stream.localId, arg1: stream.remoteId, data: Data())
                     throw ADBError.streamClosed
                 }
+                // Unrelated close; ACK and keep waiting.
+                try await sendPacket(.clse, arg0: packet.arg1, arg1: packet.arg0, data: Data())
             default:
                 continue
             }
@@ -1956,14 +2093,29 @@ struct ADBKeyPair {
 }
 
 enum ADBKeyManager {
+    // Keypair generation and persistence must be serialized. If multiple callers generate concurrently
+    // (e.g. preload + connect racing on cold start), the host key can "flip" and force re-authorization.
+    private static let keyPairLock = NSLock()
+
     static func loadOrCreateKeyPair(at path: String) throws -> ADBKeyPair {
+        keyPairLock.lock()
+        defer { keyPairLock.unlock() }
+
         let keyURL = resolveKeyURL(path: path)
         let pubURL = keyURL.appendingPathExtension("pub")
 
         // 1. Try loading from Keychain first (most reliable)
         if let keychainData = ADBKeyStorage.loadFromKeychain(),
            let privateKey = createPrivateKey(from: keychainData) {
-            let publicKey = (try? String(contentsOf: pubURL, encoding: .utf8)) ?? createPublicKeyString(from: privateKey)
+            let publicKey: String
+            if let filePublicKey = try? String(contentsOf: pubURL, encoding: .utf8),
+               !filePublicKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                publicKey = filePublicKey
+            } else {
+                publicKey = createPublicKeyString(from: privateKey)
+                // Best-effort backup; the Keychain is the source of truth.
+                try? publicKey.write(to: pubURL, atomically: true, encoding: .utf8)
+            }
             return ADBKeyPair(privateKey: privateKey, publicKey: publicKey)
         }
 
@@ -1973,7 +2125,14 @@ enum ADBKeyManager {
            let privateKey = createPrivateKey(from: data) {
             // Found in file but not in Keychain - save to Keychain for future
             _ = ADBKeyStorage.saveToKeychain(data)
-            let publicKey = (try? String(contentsOf: pubURL, encoding: .utf8)) ?? createPublicKeyString(from: privateKey)
+            let publicKey: String
+            if let filePublicKey = try? String(contentsOf: pubURL, encoding: .utf8),
+               !filePublicKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                publicKey = filePublicKey
+            } else {
+                publicKey = createPublicKeyString(from: privateKey)
+                try? publicKey.write(to: pubURL, atomically: true, encoding: .utf8)
+            }
             return ADBKeyPair(privateKey: privateKey, publicKey: publicKey)
         }
 
@@ -1999,7 +2158,7 @@ enum ADBKeyManager {
 
         // Save to file (backup)
         try FileManager.default.createDirectory(at: keyURL.deletingLastPathComponent(), withIntermediateDirectories: true)
-        try privateData.write(to: keyURL)
+        try privateData.write(to: keyURL, options: .atomic)
 
         let publicKeyString = createPublicKeyString(from: privateKey)
         try publicKeyString.write(to: pubURL, atomically: true, encoding: .utf8)

@@ -221,6 +221,23 @@ struct SettingsView: View {
                             adbManager.refreshApps()
                         }
                     }
+
+                    BeamioDivider()
+
+                    Toggle(isOn: $settings.downloadDeviceIcons) {
+                        HStack(spacing: 10) {
+                            Image(systemName: "photo.on.rectangle")
+                                .foregroundColor(BeamioTheme.teal)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("Download Device Icons")
+                                    .font(BeamioTheme.bodyFont(14))
+                                Text("Slow: pulls APKs from the device to extract icons")
+                                    .font(BeamioTheme.captionFont(11))
+                                    .foregroundColor(.secondary)
+                            }
+                        }
+                    }
+                    .tint(BeamioTheme.accent)
                 }
             }
         }
